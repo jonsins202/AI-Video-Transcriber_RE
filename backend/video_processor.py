@@ -13,37 +13,79 @@ logger = logging.getLogger(__name__)
 
 class VideoProcessor:
     """视频处理器，使用yt-dlp下载和转换视频"""
-    
+
     def __init__(self):
         self.ydl_opts = {
             'format': 'bestaudio/best',  # 优先下载最佳音频源
             'outtmpl': '%(title)s.%(ext)s',
             'postprocessors': [{
                 'key': 'FFmpegExtractAudio',
-                # 直接在提取阶段转换为单声道 16k（空间小且稳定）
-                'preferredcodec': 'm4a',
-                'preferredquality': '192'
+                # 转换为单声道 16kHz WAV（Qwen3-ASR 原生格式）
+                'preferredcodec': 'wav',
             }],
-            # 全局FFmpeg参数：单声道 + 16k 采样率 + faststart
-            'postprocessor_args': ['-ac', '1', '-ar', '16000', '-movflags', '+faststart'],
+            # 全局FFmpeg参数：单声道 + 16k 采样率
+            'postprocessor_args': ['-ac', '1', '-ar', '16000'],
             'prefer_ffmpeg': True,
             'quiet': True,
             'no_warnings': True,
             'noplaylist': True,  # 强制只下载单个视频，不下载播放列表
+            'retries': 10,           # 下载重试次数（B站CDN偶尔断连）
+            'fragment_retries': 10,  # 分片重试
+            'socket_timeout': 30,    # 单次连接超时秒数
         }
 
-    async def normalize_local_media_to_m4a(self, input_path: Path, output_dir: Path) -> str:
+    def _cookie_opts(self) -> dict:
+        """读取 Cookie 配置（环境变量优先，其次项目根目录的 cookies.txt）。
+
+        支持两种方式（优先级从高到低）：
+          1. YT_DLP_COOKIES_FROM_BROWSER=chrome / edge / firefox / brave
+             → yt-dlp 运行时从浏览器读取 Cookie（需浏览器未运行或允许共享）
+          2. cookies.txt（Netscape 格式）放在项目根目录
+             → 用浏览器扩展「Get cookies.txt LOCALLY」导出
+          3. YT_DLP_COOKIES_FILE=/path/to/cookies.txt 指定自定义路径
+
+        主要解决 B站(412 Precondition Failed)、抖音等平台的反爬限制。
         """
-        将本地上传的音视频转为单声道 16kHz AAC m4a，供 Faster-Whisper 使用（与 yt-dlp 后处理参数对齐）。
+        opts = {}
+
+        # 方式1: 从浏览器读取
+        browser = os.getenv("YT_DLP_COOKIES_FROM_BROWSER", "").strip().lower()
+        if browser:
+            opts['cookiesfrombrowser'] = (browser,)
+            logger.info(f"启用浏览器 Cookie: {browser}")
+
+        # 方式2/3: cookies.txt 文件
+        if 'cookiesfrombrowser' not in opts:
+            cookie_file = os.getenv("YT_DLP_COOKIES_FILE", "").strip()
+            if not cookie_file:
+                # 默认查找项目根目录的 cookies.txt
+                default_path = Path(__file__).parent.parent / "cookies.txt"
+                if default_path.exists():
+                    cookie_file = str(default_path)
+            if cookie_file and os.path.isfile(cookie_file):
+                    opts['cookiefile'] = cookie_file
+                    logger.info(f"使用 Cookie 文件: {cookie_file}")
+
+            # 代理配置（解决 Clash TUN 模式下 B站 API 路由不稳定等问题）
+            proxy = os.getenv("YT_DLP_PROXY", "").strip()
+            if proxy:
+                opts['proxy'] = proxy
+                logger.info(f"使用代理: {proxy}")
+
+            return opts
+
+    async def normalize_local_media_to_wav(self, input_path: Path, output_dir: Path) -> str:
+        """
+        将本地上传的音视频转为单声道 16kHz WAV，供 Qwen3-ASR 使用。
         """
         output_dir.mkdir(parents=True, exist_ok=True)
         unique_id = str(uuid.uuid4())[:8]
-        out_path = output_dir / f"upload_norm_{unique_id}.m4a"
+        out_path = output_dir / f"upload_norm_{unique_id}.wav"
 
         cmd = [
             "ffmpeg", "-y", "-nostdin", "-i", str(input_path.resolve()),
             "-vn", "-ac", "1", "-ar", "16000",
-            "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart",
+            "-c:a", "pcm_s16le",
             str(out_path.resolve()),
         ]
 
@@ -75,6 +117,7 @@ class VideoProcessor:
         try:
             # 1. 快速探测：获取视频信息和字幕可用性，不下载任何内容
             check_opts = {"quiet": True, "no_warnings": True, "noplaylist": True}
+            check_opts.update(self._cookie_opts())
             with yt_dlp.YoutubeDL(check_opts) as ydl:
                 info = await asyncio.to_thread(ydl.extract_info, url, False)
 
@@ -118,6 +161,7 @@ class VideoProcessor:
                 "no_warnings": True,
                 "noplaylist": True,
             }
+            dl_opts.update(self._cookie_opts())
             with yt_dlp.YoutubeDL(dl_opts) as ydl:
                 await asyncio.to_thread(ydl.download, [url])
 
@@ -331,7 +375,7 @@ class VideoProcessor:
         prefetched_title: Optional[str] = None,
     ) -> tuple[str, str]:
         """
-        下载视频并转换为m4a格式。
+        下载视频并转换为 WAV 格式。
 
         prefetched_title: 若调用方已通过 fetch_subtitles 探测过视频信息，
         可直接传入视频标题，跳过重复的 extract_info 网络请求。
@@ -346,6 +390,7 @@ class VideoProcessor:
             
             # 更新yt-dlp选项
             ydl_opts = self.ydl_opts.copy()
+            ydl_opts.update(self._cookie_opts())
             ydl_opts['outtmpl'] = output_template
             
             logger.info(f"开始下载视频: {url}")
@@ -367,12 +412,12 @@ class VideoProcessor:
                 # 下载视频（放到线程池避免阻塞事件循环）
                 await asyncio.to_thread(ydl.download, [url])
             
-            # 查找生成的m4a文件
-            audio_file = str(output_dir / f"audio_{unique_id}.m4a")
-            
+            # 查找生成的 wav 文件
+            audio_file = str(output_dir / f"audio_{unique_id}.wav")
+
             if not os.path.exists(audio_file):
-                # 如果m4a文件不存在，查找其他音频格式
-                for ext in ['webm', 'mp4', 'mp3', 'wav']:
+                # 如果 wav 文件不存在，查找其他音频格式
+                for ext in ['m4a', 'webm', 'mp4', 'mp3']:
                     potential_file = str(output_dir / f"audio_{unique_id}.{ext}")
                     if os.path.exists(potential_file):
                         audio_file = potential_file
@@ -394,8 +439,8 @@ class VideoProcessor:
                     f"音频时长异常，期望{expected_duration}s，实际{actual_duration}s，尝试重封装修复…"
                 )
                 try:
-                    fixed_path = str(output_dir / f"audio_{unique_id}_fixed.m4a")
-                    fix_cmd = f"ffmpeg -y -i {shlex.quote(audio_file)} -vn -c:a aac -b:a 160k -movflags +faststart {shlex.quote(fixed_path)}"
+                    fixed_path = str(output_dir / f"audio_{unique_id}_fixed.wav")
+                    fix_cmd = f"ffmpeg -y -i {shlex.quote(audio_file)} -vn -c:a pcm_s16le -ar 16000 -ac 1 {shlex.quote(fixed_path)}"
                     subprocess.check_call(fix_cmd, shell=True)
                     # 用修复后的文件替换
                     audio_file = fixed_path

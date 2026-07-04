@@ -13,9 +13,9 @@ def check_dependencies():
     import sys
     required_packages = {
         "fastapi": "fastapi",
-        "uvicorn": "uvicorn", 
+        "uvicorn": "uvicorn",
         "yt-dlp": "yt_dlp",
-        "faster-whisper": "faster_whisper",
+        "qwen-asr": "qwen_asr",
         "openai": "openai"
     }
     
@@ -68,9 +68,10 @@ def setup_environment():
         os.environ["OPENAI_BASE_URL"] = "https://oneapi.basevec.com/v1"
         print("✅ 已设置OpenAI Base URL")
     
-    # 设置其他默认配置
-    if not os.getenv("WHISPER_MODEL_SIZE"):
-        os.environ["WHISPER_MODEL_SIZE"] = "base"
+    # 设置 Qwen3-ASR 模型路径
+    if not os.getenv("QWEN3_ASR_MODEL_PATH"):
+        default_model = str(Path(__file__).parent / "models" / "Qwen3-ASR-0.6B")
+        os.environ["QWEN3_ASR_MODEL_PATH"] = default_model
     
     print("🔑 OpenAI API已配置，摘要功能可用")
     return True
