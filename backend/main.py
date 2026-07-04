@@ -3,8 +3,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 import os
+import time
 import asyncio
 import logging
+import logging.handlers
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
 import aiofiles
@@ -18,8 +21,28 @@ from transcriber import Transcriber
 from summarizer import Summarizer
 from translator import Translator
 
-# 配置日志
-logging.basicConfig(level=logging.INFO)
+# ── 日志配置：控制台 + 文件（按天轮转，保留 30 天）─────────────────────
+def setup_logging():
+    """配置根 logger：控制台 + 文件双输出，所有模块的 logger 自动落盘到 logs/app.log"""
+    log_dir = Path(__file__).parent.parent / "logs"
+    log_dir.mkdir(exist_ok=True)
+    fmt = logging.Formatter(
+        '%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+    )
+    fh = logging.handlers.TimedRotatingFileHandler(
+        log_dir / "app.log", when='midnight', backupCount=30, encoding='utf-8',
+    )
+    fh.setFormatter(fmt)
+    ch = logging.StreamHandler()
+    ch.setFormatter(fmt)
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    root.addHandler(fh)
+    root.addHandler(ch)
+
+
+setup_logging()
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="AI视频转录器", version="1.0.0")
@@ -104,6 +127,22 @@ active_tasks = {}
 # 存储SSE连接，用于实时推送状态更新
 sse_connections = {}
 
+
+@contextmanager
+def _stage(task_id: str, stage: str):
+    """记录任务阶段耗时：写日志 + tasks[task_id].timeline。
+    用法: with _stage(task_id, "transcribe"): await transcriber.transcribe(...)"""
+    t0 = time.perf_counter()
+    short = task_id.replace("-", "")[:8]
+    logger.info(f"[task:{short}] --> {stage}")
+    try:
+        yield
+    finally:
+        duration = time.perf_counter() - t0
+        logger.info(f"[task:{short}] <-- {stage} ({duration:.1f}s)")
+        if task_id in tasks:
+            tasks[task_id].setdefault("timeline", {})[stage] = round(duration, 1)
+
 # 本地上传：允许的类型与大小上限（MB），可用环境变量 UPLOAD_MAX_MB 调整
 UPLOAD_ALLOWED_EXT = frozenset({".txt", ".mp3", ".mp4", ".m4a", ".wav", ".webm", ".mkv", ".ogg", ".flac"})
 UPLOAD_MAX_MB = int(os.getenv("UPLOAD_MAX_MB", "200"))
@@ -170,7 +209,8 @@ async def _run_post_extract_pipeline(
     save_tasks(tasks)
     await broadcast_task_update(task_id, tasks[task_id])
 
-    script = await request_summarizer.optimize_transcript(raw_script)
+    with _stage(task_id, "optimize"):
+        script = await request_summarizer.optimize_transcript(raw_script)
 
     script_with_title = f"# {video_title}\n\n{script}\n\nsource: {source_ref}\n"
 
@@ -210,9 +250,10 @@ async def _run_post_extract_pipeline(
         save_tasks(tasks)
         await broadcast_task_update(task_id, tasks[task_id])
 
-        translation_content = await request_translator.translate_text(
-            script, summary_language, detected_language
-        )
+        with _stage(task_id, "translate"):
+            translation_content = await request_translator.translate_text(
+                script, summary_language, detected_language
+            )
         translation_with_title = f"# {video_title}\n\n{translation_content}\n\nsource: {source_ref}\n"
         translation_filename = f"translation_{safe_title}_{short_id}.md"
         translation_path = TEMP_DIR / translation_filename
@@ -231,7 +272,8 @@ async def _run_post_extract_pipeline(
     save_tasks(tasks)
     await broadcast_task_update(task_id, tasks[task_id])
 
-    summary = await request_summarizer.summarize(script, summary_language, video_title)
+    with _stage(task_id, "summarize"):
+        summary = await request_summarizer.summarize(script, summary_language, video_title)
     summary_with_source = summary + f"\n\nsource: {source_ref}\n"
 
     script_filename = f"transcript_{task_id}.md"
@@ -458,7 +500,7 @@ async def process_video(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"处理视频时出错: {str(e)}")
+        logger.exception(f"处理视频时出错: {e}")
         raise HTTPException(status_code=500, detail=f"处理失败: {str(e)}")
 
 async def process_video_task(
@@ -495,10 +537,11 @@ async def process_video_task(
         else:
             request_summarizer = summarizer  # 全局实例（使用环境变量）
 
-        subtitle_text, sub_title, sub_lang = await video_processor.fetch_subtitles(url, TEMP_DIR)
+        with _stage(task_id, "subtitle_fetch"):
+            subtitle_text, sub_title, sub_lang = await video_processor.fetch_subtitles(url, TEMP_DIR)
 
         if subtitle_text:
-            # ── 快速路径：有字幕，跳过音频下载和 Whisper ──────────────────
+            # ── 快速路径：有字幕，跳过音频下载和 ASR ──────────────────
             video_title = sub_title
             raw_script = subtitle_text
             # 把语言写入 transcriber，保持下游逻辑一致
@@ -511,7 +554,7 @@ async def process_video_task(
             save_tasks(tasks)
             await broadcast_task_update(task_id, tasks[task_id])
         else:
-            # ── 慢速路径：无字幕，下载音频 → Whisper 转录 ─────────────────
+            # ── 慢速路径：无字幕，下载音频 → Qwen3-ASR 转录 ─────────────────
             tasks[task_id].update({
                 "progress": 15,
                 "message": "未找到字幕，正在下载视频音频..."
@@ -519,9 +562,10 @@ async def process_video_task(
             save_tasks(tasks)
             await broadcast_task_update(task_id, tasks[task_id])
 
-            audio_path, video_title = await video_processor.download_and_convert(
-                url, TEMP_DIR, prefetched_title=sub_title or None
-            )
+            with _stage(task_id, "audio_download"):
+                audio_path, video_title = await video_processor.download_and_convert(
+                    url, TEMP_DIR, prefetched_title=sub_title or None
+                )
 
             tasks[task_id].update({
                 "progress": 35,
@@ -532,12 +576,13 @@ async def process_video_task(
 
             tasks[task_id].update({
                 "progress": 40,
-                "message": "正在转录音频（Whisper）..."
+                "message": "正在转录音频（Qwen3-ASR）..."
             })
             save_tasks(tasks)
             await broadcast_task_update(task_id, tasks[task_id])
 
-            raw_script = await transcriber.transcribe(audio_path)
+            with _stage(task_id, "transcribe"):
+                raw_script = await transcriber.transcribe(audio_path)
 
         await _run_post_extract_pipeline(
             task_id=task_id,
@@ -556,7 +601,7 @@ async def process_video_task(
         # 文件会在一定时间后自动清理或用户手动清理
 
     except Exception as e:
-        logger.error(f"任务 {task_id} 处理失败: {str(e)}")
+        logger.exception(f"任务 {task_id} 处理失败: {e}")
         # 从处理列表中移除URL
         processing_urls.discard(url)
         
@@ -633,7 +678,8 @@ async def process_upload_task(
             save_tasks(tasks)
             await broadcast_task_update(task_id, tasks[task_id])
 
-            audio_path = await video_processor.normalize_local_media_to_m4a(saved_path, TEMP_DIR)
+            with _stage(task_id, "audio_normalize"):
+                audio_path = await video_processor.normalize_local_media_to_wav(saved_path, TEMP_DIR)
 
             tasks[task_id].update({
                 "progress": 35,
@@ -644,12 +690,13 @@ async def process_upload_task(
 
             tasks[task_id].update({
                 "progress": 40,
-                "message": "正在转录音频（Whisper）...",
+                "message": "正在转录音频（Qwen3-ASR）...",
             })
             save_tasks(tasks)
             await broadcast_task_update(task_id, tasks[task_id])
 
-            raw_script = await transcriber.transcribe(audio_path)
+            with _stage(task_id, "transcribe"):
+                raw_script = await transcriber.transcribe(audio_path)
 
         await _run_post_extract_pipeline(
             task_id=task_id,
@@ -665,7 +712,7 @@ async def process_upload_task(
         )
 
     except Exception as e:
-        logger.error(f"任务 {task_id} 处理失败: {str(e)}")
+        logger.exception(f"任务 {task_id} 处理失败: {e}")
         if task_id in active_tasks:
             del active_tasks[task_id]
         tasks[task_id].update({
@@ -774,7 +821,7 @@ async def download_file(filename: str):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"下载文件失败: {e}")
+        logger.exception(f"下载文件失败: {e}")
         raise HTTPException(status_code=500, detail=f"下载失败: {str(e)}")
 
 
