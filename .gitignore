@@ -49,6 +49,11 @@ temp/
 .env.local
 .env.production
 
+# Cookies / credentials (yt-dlp 登录凭据，切勿提交)
+cookies.txt
+*.cookies
+*.cookies.txt
+
 # Audio/Video files
 *.mp4
 *.avi
