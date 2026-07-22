@@ -248,13 +248,17 @@ class _FunASRBackend:
 
     @staticmethod
     def _parse_language(raw_text: str, result) -> Optional[str]:
-        # SenseVoice：<|zh|> 前缀标签
-        m = re.search(r"<\|([a-zA-Z]{2,5})\|>", raw_text or "")
-        if m:
-            tag = m.group(1).lower()
+        # SenseVoice 可能混入情绪/事件/噪声标签；只接受已知语言并继续扫描后续标签。
+        supported_iso = set(LANG_NAME_TO_ISO.values())
+        for matched in re.finditer(r"<\|([a-zA-Z]{2,8})\|>", raw_text or ""):
+            tag = matched.group(1).lower()
             if tag in _SENSEVOICE_LANG_TAG:
-                return _SENSEVOICE_LANG_TAG[tag]   # auto → None（未知），已知语种 → ISO
-            return tag   # 未知语种原样返回（如 fr/de）
+                mapped = _SENSEVOICE_LANG_TAG[tag]
+                if mapped:
+                    return mapped
+                continue
+            if tag in supported_iso:
+                return tag
         # Paraformer：result["language"]
         lang = result.get("language") if hasattr(result, "get") else None
         if lang:
