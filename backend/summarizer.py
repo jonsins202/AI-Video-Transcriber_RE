@@ -1,9 +1,21 @@
 import os
 import openai
 import logging
+import asyncio
+from collections import Counter
+import json
+import re
 from typing import Optional
 
 from llm_sanitize import strip_llm_artifacts
+from lossless_optimizer import (
+    SegmentBatch,
+    assemble_segments,
+    build_batches,
+    evaluate_batch_response,
+    fallback_batch,
+    split_source_segments,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +49,7 @@ class Summarizer:
         # 允许前端指定模型，覆盖硬编码的 gpt-3.5-turbo / gpt-4o
         self.fast_model     = model or "gpt-3.5-turbo"
         self.advanced_model = model or "gpt-4o"
+        self.last_optimization_audit = None
         
         # 支持的语言映射
         self.language_map = {
@@ -64,27 +77,182 @@ class Summarizer:
         Returns:
             优化后的转录文本（Markdown格式）
         """
+        body = self.extract_transcript_body(raw_transcript)
+        return await self.optimize_transcript_body(body)
+
+    async def optimize_transcript_body(
+        self, body: str, transcript_language: Optional[str] = None
+    ) -> str:
+        """严格无损优化纯正文；任何未验证段均回退原文。"""
+        if not body:
+            self.last_optimization_audit = {
+                "model": self.fast_model,
+                "source_length": 0,
+                "segment_count": 0,
+                "batch_count": 0,
+                "status_counts": {},
+                "segments": [],
+            }
+            return body
+        language = transcript_language or self._detect_transcript_language(body)
         try:
-            if not self.client:
-                logger.warning("OpenAI API不可用，返回原始转录")
-                return raw_transcript
+            return await self._optimize_lossless_body(body, language)
+        except Exception:
+            logger.exception("无损优化管线异常，返回完整原文")
+            self.last_optimization_audit = {
+                "model": self.fast_model,
+                "source_length": len(body),
+                "segment_count": 0,
+                "batch_count": 0,
+                "status_counts": {"fallback_pipeline": 1},
+                "segments": [],
+            }
+            return body
 
-            # 预处理：仅移除时间戳与元信息，保留全部口语/重复内容
-            preprocessed = self._remove_timestamps_and_meta(raw_transcript)
-            # 使用JS策略：按字符长度分块（更贴近tokens上限，避免估算误差）
-            detected_lang_code = self._detect_transcript_language(preprocessed)
-            max_chars_per_chunk = 4000  # 对齐JS：每块最大约4000字符
+    def get_last_optimization_audit(self) -> Optional[dict]:
+        return self.last_optimization_audit
 
-            if len(preprocessed) > max_chars_per_chunk:
-                logger.info(f"文本较长({len(preprocessed)} chars)，启用分块优化")
-                return await self._format_long_transcript_in_chunks(preprocessed, detected_lang_code, max_chars_per_chunk)
+    @staticmethod
+    def _extract_json_object(content: str) -> dict:
+        text = (content or "").strip()
+        if text.startswith("```"):
+            text = text.split("\n", 1)[1] if "\n" in text else ""
+            if text.rstrip().endswith("```"):
+                text = text.rstrip()[:-3]
+        start, end = text.find("{"), text.rfind("}")
+        if start < 0 or end < start:
+            raise ValueError("response does not contain a JSON object")
+        payload = json.loads(text[start:end + 1])
+        if not isinstance(payload, dict):
+            raise ValueError("response JSON must be an object")
+        return payload
+
+    async def _call_lossless_batch(self, batch: SegmentBatch, language: str) -> dict:
+        request_payload = {
+            "left_context": batch.left_context,
+            "segments": [
+                {"id": segment.id, "text": segment.source_text}
+                for segment in batch.segments
+            ],
+            "right_context": batch.right_context,
+        }
+        system_prompt = (
+            "你是严格无损的转录校对器。left_context/right_context 仅供理解，禁止输出。"
+            "segments 中每个 id 必须恰好返回一次且不可改名、遗漏、重复或重排。"
+            "只允许添加标点和分段、修正少量错别字/同音字/专有名词；"
+            "禁止删除、概括、合并、扩写或改变任何口语、重复、寒暄、引用和举例。"
+            "只输出一个 JSON 对象：{\"segments\":[{\"id\":\"...\",\"text\":\"...\"}]}。"
+            f"正文语言：{language or 'unknown'}。"
+        )
+        try:
+            response = await asyncio.to_thread(
+                self.client.chat.completions.create,
+                model=self.fast_model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {
+                        "role": "user",
+                        "content": json.dumps(request_payload, ensure_ascii=False),
+                    },
+                ],
+                max_tokens=5000,
+                temperature=0.0,
+            )
+            if not getattr(response, "choices", None):
+                return {"ok": False, "reason": "missing_choice"}
+            choice = response.choices[0]
+            finish_reason = getattr(choice, "finish_reason", None)
+            if finish_reason != "stop":
+                return {
+                    "ok": False,
+                    "reason": "finish_reason",
+                    "finish_reason": finish_reason,
+                }
+            content = getattr(getattr(choice, "message", None), "content", "") or ""
+            if not content.strip():
+                return {"ok": False, "reason": "empty_response"}
+            return {
+                "ok": True,
+                "payload": self._extract_json_object(content),
+                "finish_reason": finish_reason,
+            }
+        except Exception as exc:
+            return {"ok": False, "reason": "api_or_json", "error": str(exc)}
+
+    async def _process_lossless_batch(
+        self, batch: SegmentBatch, language: str, allow_split: bool = True
+    ) -> dict:
+        result = await self._call_lossless_batch(batch, language)
+        if (
+            not result.get("ok")
+            and result.get("finish_reason") == "length"
+            and allow_split
+            and len(batch.segments) > 1
+        ):
+            midpoint = len(batch.segments) // 2
+            left = SegmentBatch(tuple(batch.segments[:midpoint]), batch.left_context, "")
+            right = SegmentBatch(tuple(batch.segments[midpoint:]), "", batch.right_context)
+            decisions = await self._process_lossless_batch(left, language, allow_split=False)
+            decisions.update(
+                await self._process_lossless_batch(right, language, allow_split=False)
+            )
+            return decisions
+        if not result.get("ok"):
+            retry = await self._call_lossless_batch(batch, language)
+            if retry.get("ok"):
+                result = retry
             else:
-                return await self._format_single_chunk(preprocessed, detected_lang_code)
+                reason = retry.get("reason") or result.get("reason") or "unknown"
+                status = (
+                    "fallback_finish_reason"
+                    if reason == "finish_reason"
+                    else "fallback_api"
+                )
+                return fallback_batch(batch.segments, status, reason)
+        return evaluate_batch_response(batch.segments, result["payload"])
 
-        except Exception as e:
-            logger.error(f"优化转录文本失败: {str(e)}")
-            logger.info("返回原始转录文本")
-            return raw_transcript
+    async def _optimize_lossless_body(self, body: str, language: str) -> str:
+        segments = split_source_segments(body)
+        batches = build_batches(body, segments)
+        decisions = {}
+        if not self.client:
+            logger.warning("OpenAI API不可用，无损优化全部回退原文")
+            for batch in batches:
+                decisions.update(
+                    fallback_batch(batch.segments, "fallback_api", "client_unavailable")
+                )
+        else:
+            logger.info(
+                f"无损优化: {len(segments)} 段, {len(batches)} 批, 串行处理"
+            )
+            for index, batch in enumerate(batches, 1):
+                logger.info(f"无损优化批次 {index}/{len(batches)}")
+                decisions.update(await self._process_lossless_batch(batch, language))
+
+        status_counts = Counter(decision.status for decision in decisions.values())
+        self.last_optimization_audit = {
+            "model": self.fast_model,
+            "source_length": len(body),
+            "segment_count": len(segments),
+            "batch_count": len(batches),
+            "status_counts": dict(status_counts),
+            "segments": [
+                {
+                    "id": segment.id,
+                    "start": segment.start,
+                    "end": segment.end,
+                    "source_hash": segment.source_hash,
+                    "result_hash": decisions[segment.id].result_hash,
+                    "status": decisions[segment.id].status,
+                    "reason": decisions[segment.id].reason,
+                    "replaced": decisions[segment.id].replaced,
+                    "inserted": decisions[segment.id].inserted,
+                    "deleted": decisions[segment.id].deleted,
+                }
+                for segment in segments
+            ],
+        }
+        return assemble_segments(segments, decisions)
 
     def _estimate_tokens(self, text: str) -> int:
         """
@@ -125,30 +293,49 @@ class Summarizer:
         formatted = re.sub(r"\n+$", "", formatted)
         return formatted
 
-    async def _format_single_chunk(self, chunk_text: str, transcript_language: str = 'zh') -> str:
-        """单块优化（修正+格式化），遵循4000 tokens 限制。"""
+    async def _format_single_chunk(self, chunk_text: str, transcript_language: str = 'zh',
+                                   prev_context: Optional[str] = None) -> str:
+        """单块优化（修正+格式化），遵循4000 tokens 限制。
+
+        prev_context: 长文本分块时传入的"上一块结尾"，仅作为衔接上下文喂给 LLM，
+            放在独立于正文的【上一段结尾】参考区并明确禁止复述；取代旧实现把
+            [上文续：…] 拼进"原始转录文本"导致的标记泄漏与上下文重复。
+        """
         # 构建与JS版一致的系统/用户提示
         if transcript_language == 'zh':
+            context_block = (
+                "<previous_context>\n"
+                f"{prev_context}\n"
+                "</previous_context>\n\n"
+            ) if prev_context else ""
             prompt = (
                 "请对以下音频转录文本进行智能优化和格式化，要求：\n\n"
                 "**内容优化（正确性优先）：**\n"
                 "1. 错误修正（转录错误/错别字/同音字/专有名词）\n"
                 "2. 适度改善语法，补全不完整句子，保持原意和语言不变\n"
                 "3. 口语处理：保留自然口语与重复表达，不要删减内容，仅添加必要标点\n"
-                "4. **绝对不要改变人称代词（I/我、you/你等）和说话者视角**\n\n"
+                "4. **绝对不要改变人称代词（I/我、you/你等）和说话者视角**\n"
+                "5. **严禁删减任何句子**：开场白、主持人介绍、寒暄、引用、举例都属正文，必须逐句完整保留，禁止跳过、概括或合并删除。只修错别字+加标点，绝不删内容\n\n"
                 "**分段规则：**\n"
                 "- 按主题和逻辑含义分段，每段包含1-8个相关句子\n"
                 "- 单段长度不超过400字符\n"
                 "- 避免过多的短段落，合并相关内容\n\n"
                 "**格式要求：**Markdown 段落，段落间空行\n\n"
-                f"原始转录文本：\n{chunk_text}"
+                f"{context_block}原始转录文本：\n{chunk_text}"
             )
             system_prompt = (
                 "你是专业的音频转录文本优化助手，修正错误、改善通顺度和排版格式，"
                 "必须保持原意，不得删减口语/重复/细节；仅移除时间戳或元信息。"
                 "绝对不要改变人称代词或说话者视角。这可能是访谈对话，访谈者用'you'，被访者用'I/we'。"
+                "严禁删减任何句子（尤其开场白、主持人介绍、寒暄），必须逐句保留全部内容。"
+                "输入中的 <previous_context> 标签是上一段结尾，仅供理解上下文衔接，严禁将其任何内容复述或改写进你的输出。"
             )
         else:
+            context_block = (
+                "<previous_context>\n"
+                f"{prev_context}\n"
+                "</previous_context>\n\n"
+            ) if prev_context else ""
             prompt = (
                 "Please intelligently optimize and format the following audio transcript text:\n\n"
                 "Content Optimization (Accuracy First):\n"
@@ -158,16 +345,19 @@ class Summarizer:
                 "4. **NEVER change pronouns (I, you, he, she, etc.) or speaker perspective**\n\n"
                 "Segmentation Rules: Group 1-8 related sentences per paragraph by topic/logic; paragraph length NOT exceed 400 characters; avoid too many short paragraphs\n\n"
                 "Format: Markdown paragraphs with blank lines between paragraphs\n\n"
-                f"Original transcript text:\n{chunk_text}"
+                f"{context_block}Original transcript text:\n{chunk_text}"
             )
             system_prompt = (
                 "You are a professional transcript formatting assistant. Fix errors and improve fluency "
                 "without changing meaning or removing any content; only timestamps/meta may be removed; keep Markdown paragraphs with blank lines. "
                 "NEVER change pronouns or speaker perspective. This may be an interview: interviewer uses 'you', interviewee uses 'I/we'."
+                " The <previous_context> tag in the input is the end of the previous segment, for continuity context ONLY; NEVER reproduce or paraphrase any of it in your output."
             )
 
         try:
-            response = self.client.chat.completions.create(
+            import asyncio
+            response = await asyncio.to_thread(
+                self.client.chat.completions.create,
                 model=self.fast_model,
                 messages=[
                     {"role": "system", "content": system_prompt},
@@ -244,6 +434,63 @@ class Summarizer:
                     return prefix[:cut]
                 return suffix
         return ""
+
+    def _strip_context_echo(self, text: str, prev_context: str,
+                            ratio_threshold: float = 0.65) -> str:
+        """后置兜底：若 text 开头复述了 prev_context（LLM 不听话把上一段结尾写进输出），截掉重复段。
+
+        邻接去重 _find_overlap_between_texts 只兜"逐字滚动重叠"，对"LLM 把整段上下文从头
+        复述"无效——复述会带改写、且从头讲而非尾首相接（task:37ee27 真实案例 ratio=0.752）。
+        本方法用相似度兜底：逐字前缀复述直接截；否则 text 开头窗口与 prev_context 相似度
+        超阈值且命中过半 → 截到最远命中位置。阈值从严（0.65 + 命中过半 + 匹配块≥4字），
+        宁可漏过也不误删正文；触发时 log warning 便于察觉误删。
+        已知限制：对高度同质/重复结构的文本（罕见；真实转录内容多样、风险低），
+        可能误判为复述并截掉开头几句；若误删频繁可调高 ratio_threshold。
+        """
+        if not prev_context or not text:
+            return text
+        import difflib
+        text_l = text.lstrip()
+        # 1) 逐字前缀复述（最稳）
+        if text_l.startswith(prev_context):
+            logger.info(f"检测到逐字复述上文，已截掉 {len(prev_context)} 字")
+            return text_l[len(prev_context):].lstrip()
+        # 2) 相似度复述（带改写）
+        window = text_l[:len(prev_context) + 60]
+        sm = difflib.SequenceMatcher(None, prev_context, window)
+        if sm.ratio() >= ratio_threshold:
+            farthest = 0
+            for _a, b, size in sm.get_matching_blocks():
+                if size >= 4:
+                    farthest = max(farthest, b + size)
+            if farthest > len(prev_context) * 0.5:
+                logger.warning(
+                    f"检测到疑似复述上文（相似度 {sm.ratio():.2f}），截掉开头 {farthest} 字；"
+                    f"若误删正文请检查分块或降低 ratio_threshold"
+                )
+                return text_l[farthest:].lstrip()
+        return text
+
+    def _maybe_overall_fallback(self, merged: str, raw_transcript: str,
+                                threshold: float = 0.60) -> str:
+        """整体长度兜底：优化+去重后若整体明显短于原始（<threshold），整体用基础格式化兜底。
+
+        单块 70% 兜底能拦住"某块输出过短"（如跳段、过度精简），但拦不住单块兜底自身失效、
+        去重误删等边缘情况。本方法作为最后防线：不管什么原因，整体丢 >(1-threshold) 就整体回退，
+        宁可不优化也不丢段（task:1128f3 即严重丢失案例：块3跳段丢 ~4000 字核心论述）。
+        正常优化长度基本持平或略增（修错别字+分段），threshold=0.60 不会误触发。
+        """
+        if not merged.strip():
+            logger.warning("优化后整体为空，整体使用原文兜底")
+            return self._apply_basic_formatting(raw_transcript)
+        if len(merged.strip()) < len(raw_transcript) * threshold:
+            ratio_pct = len(merged.strip()) * 100 // max(1, len(raw_transcript))
+            logger.warning(
+                f"优化后整体过短（{len(merged.strip())} vs 原始 {len(raw_transcript)}，"
+                f"{ratio_pct}%），疑丢大段内容，整体兜底"
+            )
+            return self._apply_basic_formatting(raw_transcript)
+        return merged
 
     def _apply_basic_formatting(self, text: str) -> str:
         """当AI失败时的回退：按句子拼段，段落≤250字符，双换行分隔。"""
@@ -328,17 +575,29 @@ class Summarizer:
 
         logger.info(f"文本分为 {len(final_chunks)} 块处理")
 
+        # 串行处理。注：曾改为并发（gather+Semaphore）提速，但 DeepSeek 在并发压力下
+        # 偶发返回不完整/过度精简的输出，导致开场等大段内容丢失（实测丢 ~25k 字符/28%）。
+        # 质量优先，回归串行（一次一个请求，LLM 输出稳定）。
         optimized = []
         for i, c in enumerate(final_chunks):
-            chunk_with_context = c
-            if i > 0:
-                prev_tail = final_chunks[i - 1][-100:]
-                marker = f"[上文续：{prev_tail}]" if transcript_language == 'zh' else f"[Context continued: {prev_tail}]"
-                chunk_with_context = marker + "\n\n" + c
+            # 上一块【优化后输出】的结尾作为衔接上下文（取优化后而非原文，让"喂 LLM 的上下文"
+            # 与下方 _strip_context_echo / 邻接去重比较的 prev 是同一份文本，且质量更高）。
+            # 用 <previous_context> 标签结构化喂给 LLM，弱模型对标签边界更敏感、不易当正文复述。
+            prev_context = optimized[-1][-100:] if optimized else None
             try:
-                oc = await self._format_single_chunk(chunk_with_context, transcript_language)
-                # 移除上下文标记
-                oc = re.sub(r"^\[(上文续|Context continued)：?:?.*?\]\s*", "", oc, flags=re.S)
+                oc = await self._format_single_chunk(c, transcript_language, prev_context=prev_context)
+                # 后置兜底：LLM 偶发把 <previous_context> 内容复述进输出开头。邻接去重只兜逐字
+                # 滚动重叠、兜不住"整段从头复述"（task:37ee27 真实案例 ratio=0.752），这里相似度截断。
+                if prev_context:
+                    oc = self._strip_context_echo(oc, prev_context)
+                # 质量校验：LLM 偶发过度精简（把正文当冗余删，如开场介绍）。若优化后明显短于原始（<70%）
+                # 疑丢内容 → 用原始块基础格式化兜底（保留全部内容，宁可不优化也不丢段）
+                if not oc.strip():
+                    logger.warning(f"第 {i+1} 块优化结果为空，使用原始块兜底")
+                    oc = self._apply_basic_formatting(c)
+                elif len(oc.strip()) < len(c.strip()) * 0.7:
+                    logger.warning(f"第 {i+1} 块优化后异常短（{len(oc.strip())} vs 原始 {len(c.strip())}），疑丢内容，用原始块兜底")
+                    oc = self._apply_basic_formatting(c)
                 optimized.append(oc)
             except Exception as e:
                 logger.warning(f"第 {i+1} 块优化失败，使用基础格式化: {e}")
@@ -360,27 +619,41 @@ class Summarizer:
 
         merged = "\n\n".join(deduped)
         merged = self._remove_transcript_heading(merged)
+        merged = self._maybe_overall_fallback(merged, raw_transcript)
         enforced = self._enforce_paragraph_max_chars(merged, max_chars=400)
         return self._ensure_markdown_paragraphs(enforced)
 
-    def _remove_timestamps_and_meta(self, text: str) -> str:
-        """仅移除时间戳行与明显元信息（标题、检测语言等），保留原文口语/重复。"""
-        lines = text.split('\n')
+    @staticmethod
+    def extract_transcript_body(text: str) -> str:
+        """从兼容 Markdown 中只移除本项目生成的元信息，保留用户正文。"""
+        if not text:
+            return text
         kept = []
-        for line in lines:
-            s = line.strip()
-            # 跳过时间戳与元信息
-            if (s.startswith('**[') and s.endswith(']**')):
+        generated_titles = {"# Video Transcription", "# 视频转录"}
+        metadata_pattern = re.compile(
+            r"^\*\*(?:Detected Language|Language Probability|检测语言|语言概率):\*\*"
+        )
+        content_heading_pattern = re.compile(
+            r"^#{1,6}\s*(?:Transcription Content|转录内容)\s*$",
+            flags=re.I,
+        )
+        timestamp_pattern = re.compile(r"^\*\*\[[^\]]+\]\*\*$")
+        for line in text.replace("\r\n", "\n").split("\n"):
+            stripped = line.strip()
+            if stripped in generated_titles:
                 continue
-            if s.startswith('# '):
-                # 跳过顶级标题（通常是视频标题，可在最终加回）
+            if metadata_pattern.match(stripped):
                 continue
-            if s.startswith('**检测语言:**') or s.startswith('**语言概率:**'):
+            if content_heading_pattern.match(stripped):
+                continue
+            if timestamp_pattern.match(stripped):
                 continue
             kept.append(line)
-        # 规范空行
-        cleaned = '\n'.join(kept)
-        return cleaned
+        return re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).strip()
+
+    def _remove_timestamps_and_meta(self, text: str) -> str:
+        """兼容旧调用；统一委托给正文提取器。"""
+        return self.extract_transcript_body(text)
 
     def _enforce_paragraph_max_chars(self, text: str, max_chars: int = 400) -> str:
         """按段落拆分并确保每段不超过max_chars，必要时按句子边界拆为多段。"""
@@ -519,9 +792,9 @@ Output ONLY the summary body in {language_name}."""
         chunk_summaries = []
         
         # 每块生成局部摘要
+        # 预构造每块 prompt（块间无依赖：每块只看自己的原文+编号，可全部预先组装）
+        prompts = []
         for i, chunk in enumerate(chunks):
-            logger.info(f"正在摘要第 {i+1}/{len(chunks)} 块...")
-            
             system_prompt = f"""You are a summarization expert. Write a brief section summary in {language_name}.
 
 This is part {i+1} of {len(chunks)} of the full transcript.
@@ -530,32 +803,44 @@ Rules:
 - About 80–160 words in {language_name}; bullets OK for key points.
 - Do not echo the transcript verbatim; capture only new information in this segment.
 - No preamble or meta-closings."""
-
             user_prompt = f"""[Part {i+1}/{len(chunks)}] Summarize in {language_name} (80–160 words, tight prose):
 
 {chunk}
 
 Output content only, no headings like "Summary:"."""
+            prompts.append((system_prompt, user_prompt, chunk))
 
-            try:
-                response = self.client.chat.completions.create(
-                    model=self.advanced_model,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt}
-                    ],
-                    max_tokens=600,
-                    temperature=0.25
-                )
-                
-                chunk_summary = strip_llm_artifacts(response.choices[0].message.content or "")
-                chunk_summaries.append(chunk_summary)
-                
-            except Exception as e:
-                logger.error(f"摘要第 {i+1} 块失败: {e}")
-                # 失败时生成简单摘要
-                simple_summary = f"第{i+1}部分内容概述：" + chunk[:200] + "..."
-                chunk_summaries.append(simple_summary)
+        # 并发调用（semaphore 控制并发数，避免 DeepSeek 速率限制）；每块输入/输出与串行完全一致 → 质量不变
+        import asyncio, os
+        try:
+            concurrency = max(1, int(os.getenv("SUMMARY_CONCURRENCY", "6")))
+        except (ValueError, TypeError):
+            concurrency = 6
+        sem = asyncio.Semaphore(concurrency)
+        logger.info(f"并发摘要: {len(chunks)} 块，并发数 {concurrency}")
+
+        async def _summarize_one(idx: int, sp: str, up: str, chunk: str) -> str:
+            async with sem:
+                logger.info(f"正在摘要第 {idx+1}/{len(chunks)} 块...")
+                try:
+                    response = await asyncio.to_thread(
+                        self.client.chat.completions.create,
+                        model=self.advanced_model,
+                        messages=[
+                            {"role": "system", "content": sp},
+                            {"role": "user", "content": up}
+                        ],
+                        max_tokens=600,
+                        temperature=0.25
+                    )
+                    return strip_llm_artifacts(response.choices[0].message.content or "")
+                except Exception as e:
+                    logger.error(f"摘要第 {idx+1} 块失败: {e}")
+                    return f"第{idx+1}部分内容概述：" + chunk[:200] + "..."
+
+        chunk_summaries = list(await asyncio.gather(
+            *[_summarize_one(i, sp, up, c) for i, (sp, up, c) in enumerate(prompts)]
+        ))
         
         # 合并所有局部摘要（带编号），如分块较多则分层整合（不引入小标题）
         combined_summaries = "\n\n".join([f"[Part {idx+1}]\n" + s for idx, s in enumerate(chunk_summaries)])
