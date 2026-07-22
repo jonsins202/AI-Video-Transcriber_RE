@@ -1,9 +1,21 @@
 import os
 import openai
 import logging
+import asyncio
+from collections import Counter
+import json
+import re
 from typing import Optional
 
 from llm_sanitize import strip_llm_artifacts
+from lossless_optimizer import (
+    SegmentBatch,
+    assemble_segments,
+    build_batches,
+    evaluate_batch_response,
+    fallback_batch,
+    split_source_segments,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +49,7 @@ class Summarizer:
         # 允许前端指定模型，覆盖硬编码的 gpt-3.5-turbo / gpt-4o
         self.fast_model     = model or "gpt-3.5-turbo"
         self.advanced_model = model or "gpt-4o"
+        self.last_optimization_audit = None
         
         # 支持的语言映射
         self.language_map = {
@@ -64,27 +77,182 @@ class Summarizer:
         Returns:
             优化后的转录文本（Markdown格式）
         """
+        body = self.extract_transcript_body(raw_transcript)
+        return await self.optimize_transcript_body(body)
+
+    async def optimize_transcript_body(
+        self, body: str, transcript_language: Optional[str] = None
+    ) -> str:
+        """严格无损优化纯正文；任何未验证段均回退原文。"""
+        if not body:
+            self.last_optimization_audit = {
+                "model": self.fast_model,
+                "source_length": 0,
+                "segment_count": 0,
+                "batch_count": 0,
+                "status_counts": {},
+                "segments": [],
+            }
+            return body
+        language = transcript_language or self._detect_transcript_language(body)
         try:
-            if not self.client:
-                logger.warning("OpenAI API不可用，返回原始转录")
-                return raw_transcript
+            return await self._optimize_lossless_body(body, language)
+        except Exception:
+            logger.exception("无损优化管线异常，返回完整原文")
+            self.last_optimization_audit = {
+                "model": self.fast_model,
+                "source_length": len(body),
+                "segment_count": 0,
+                "batch_count": 0,
+                "status_counts": {"fallback_pipeline": 1},
+                "segments": [],
+            }
+            return body
 
-            # 预处理：仅移除时间戳与元信息，保留全部口语/重复内容
-            preprocessed = self._remove_timestamps_and_meta(raw_transcript)
-            # 使用JS策略：按字符长度分块（更贴近tokens上限，避免估算误差）
-            detected_lang_code = self._detect_transcript_language(preprocessed)
-            max_chars_per_chunk = 4000  # 对齐JS：每块最大约4000字符
+    def get_last_optimization_audit(self) -> Optional[dict]:
+        return self.last_optimization_audit
 
-            if len(preprocessed) > max_chars_per_chunk:
-                logger.info(f"文本较长({len(preprocessed)} chars)，启用分块优化")
-                return await self._format_long_transcript_in_chunks(preprocessed, detected_lang_code, max_chars_per_chunk)
+    @staticmethod
+    def _extract_json_object(content: str) -> dict:
+        text = (content or "").strip()
+        if text.startswith("```"):
+            text = text.split("\n", 1)[1] if "\n" in text else ""
+            if text.rstrip().endswith("```"):
+                text = text.rstrip()[:-3]
+        start, end = text.find("{"), text.rfind("}")
+        if start < 0 or end < start:
+            raise ValueError("response does not contain a JSON object")
+        payload = json.loads(text[start:end + 1])
+        if not isinstance(payload, dict):
+            raise ValueError("response JSON must be an object")
+        return payload
+
+    async def _call_lossless_batch(self, batch: SegmentBatch, language: str) -> dict:
+        request_payload = {
+            "left_context": batch.left_context,
+            "segments": [
+                {"id": segment.id, "text": segment.source_text}
+                for segment in batch.segments
+            ],
+            "right_context": batch.right_context,
+        }
+        system_prompt = (
+            "你是严格无损的转录校对器。left_context/right_context 仅供理解，禁止输出。"
+            "segments 中每个 id 必须恰好返回一次且不可改名、遗漏、重复或重排。"
+            "只允许添加标点和分段、修正少量错别字/同音字/专有名词；"
+            "禁止删除、概括、合并、扩写或改变任何口语、重复、寒暄、引用和举例。"
+            "只输出一个 JSON 对象：{\"segments\":[{\"id\":\"...\",\"text\":\"...\"}]}。"
+            f"正文语言：{language or 'unknown'}。"
+        )
+        try:
+            response = await asyncio.to_thread(
+                self.client.chat.completions.create,
+                model=self.fast_model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {
+                        "role": "user",
+                        "content": json.dumps(request_payload, ensure_ascii=False),
+                    },
+                ],
+                max_tokens=5000,
+                temperature=0.0,
+            )
+            if not getattr(response, "choices", None):
+                return {"ok": False, "reason": "missing_choice"}
+            choice = response.choices[0]
+            finish_reason = getattr(choice, "finish_reason", None)
+            if finish_reason != "stop":
+                return {
+                    "ok": False,
+                    "reason": "finish_reason",
+                    "finish_reason": finish_reason,
+                }
+            content = getattr(getattr(choice, "message", None), "content", "") or ""
+            if not content.strip():
+                return {"ok": False, "reason": "empty_response"}
+            return {
+                "ok": True,
+                "payload": self._extract_json_object(content),
+                "finish_reason": finish_reason,
+            }
+        except Exception as exc:
+            return {"ok": False, "reason": "api_or_json", "error": str(exc)}
+
+    async def _process_lossless_batch(
+        self, batch: SegmentBatch, language: str, allow_split: bool = True
+    ) -> dict:
+        result = await self._call_lossless_batch(batch, language)
+        if (
+            not result.get("ok")
+            and result.get("finish_reason") == "length"
+            and allow_split
+            and len(batch.segments) > 1
+        ):
+            midpoint = len(batch.segments) // 2
+            left = SegmentBatch(tuple(batch.segments[:midpoint]), batch.left_context, "")
+            right = SegmentBatch(tuple(batch.segments[midpoint:]), "", batch.right_context)
+            decisions = await self._process_lossless_batch(left, language, allow_split=False)
+            decisions.update(
+                await self._process_lossless_batch(right, language, allow_split=False)
+            )
+            return decisions
+        if not result.get("ok"):
+            retry = await self._call_lossless_batch(batch, language)
+            if retry.get("ok"):
+                result = retry
             else:
-                return await self._format_single_chunk(preprocessed, detected_lang_code)
+                reason = retry.get("reason") or result.get("reason") or "unknown"
+                status = (
+                    "fallback_finish_reason"
+                    if reason == "finish_reason"
+                    else "fallback_api"
+                )
+                return fallback_batch(batch.segments, status, reason)
+        return evaluate_batch_response(batch.segments, result["payload"])
 
-        except Exception as e:
-            logger.error(f"优化转录文本失败: {str(e)}")
-            logger.info("返回原始转录文本")
-            return raw_transcript
+    async def _optimize_lossless_body(self, body: str, language: str) -> str:
+        segments = split_source_segments(body)
+        batches = build_batches(body, segments)
+        decisions = {}
+        if not self.client:
+            logger.warning("OpenAI API不可用，无损优化全部回退原文")
+            for batch in batches:
+                decisions.update(
+                    fallback_batch(batch.segments, "fallback_api", "client_unavailable")
+                )
+        else:
+            logger.info(
+                f"无损优化: {len(segments)} 段, {len(batches)} 批, 串行处理"
+            )
+            for index, batch in enumerate(batches, 1):
+                logger.info(f"无损优化批次 {index}/{len(batches)}")
+                decisions.update(await self._process_lossless_batch(batch, language))
+
+        status_counts = Counter(decision.status for decision in decisions.values())
+        self.last_optimization_audit = {
+            "model": self.fast_model,
+            "source_length": len(body),
+            "segment_count": len(segments),
+            "batch_count": len(batches),
+            "status_counts": dict(status_counts),
+            "segments": [
+                {
+                    "id": segment.id,
+                    "start": segment.start,
+                    "end": segment.end,
+                    "source_hash": segment.source_hash,
+                    "result_hash": decisions[segment.id].result_hash,
+                    "status": decisions[segment.id].status,
+                    "reason": decisions[segment.id].reason,
+                    "replaced": decisions[segment.id].replaced,
+                    "inserted": decisions[segment.id].inserted,
+                    "deleted": decisions[segment.id].deleted,
+                }
+                for segment in segments
+            ],
+        }
+        return assemble_segments(segments, decisions)
 
     def _estimate_tokens(self, text: str) -> int:
         """
@@ -455,24 +623,37 @@ class Summarizer:
         enforced = self._enforce_paragraph_max_chars(merged, max_chars=400)
         return self._ensure_markdown_paragraphs(enforced)
 
-    def _remove_timestamps_and_meta(self, text: str) -> str:
-        """仅移除时间戳行与明显元信息（标题、检测语言等），保留原文口语/重复。"""
-        lines = text.split('\n')
+    @staticmethod
+    def extract_transcript_body(text: str) -> str:
+        """从兼容 Markdown 中只移除本项目生成的元信息，保留用户正文。"""
+        if not text:
+            return text
         kept = []
-        for line in lines:
-            s = line.strip()
-            # 跳过时间戳与元信息
-            if (s.startswith('**[') and s.endswith(']**')):
+        generated_titles = {"# Video Transcription", "# 视频转录"}
+        metadata_pattern = re.compile(
+            r"^\*\*(?:Detected Language|Language Probability|检测语言|语言概率):\*\*"
+        )
+        content_heading_pattern = re.compile(
+            r"^#{1,6}\s*(?:Transcription Content|转录内容)\s*$",
+            flags=re.I,
+        )
+        timestamp_pattern = re.compile(r"^\*\*\[[^\]]+\]\*\*$")
+        for line in text.replace("\r\n", "\n").split("\n"):
+            stripped = line.strip()
+            if stripped in generated_titles:
                 continue
-            if s.startswith('# '):
-                # 跳过顶级标题（通常是视频标题，可在最终加回）
+            if metadata_pattern.match(stripped):
                 continue
-            if s.startswith('**检测语言:**') or s.startswith('**语言概率:**'):
+            if content_heading_pattern.match(stripped):
+                continue
+            if timestamp_pattern.match(stripped):
                 continue
             kept.append(line)
-        # 规范空行
-        cleaned = '\n'.join(kept)
-        return cleaned
+        return re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).strip()
+
+    def _remove_timestamps_and_meta(self, text: str) -> str:
+        """兼容旧调用；统一委托给正文提取器。"""
+        return self.extract_transcript_body(text)
 
     def _enforce_paragraph_max_chars(self, text: str, max_chars: int = 400) -> str:
         """按段落拆分并确保每段不超过max_chars，必要时按句子边界拆为多段。"""

@@ -17,6 +17,7 @@ mock 掉 OpenAI client（不依赖真实 API），覆盖：
 """
 import os
 import sys
+import json
 import unittest
 from unittest.mock import patch
 
@@ -52,13 +53,14 @@ class _Message:
 
 
 class _Choice:
-    def __init__(self, content):
+    def __init__(self, content, finish_reason="stop"):
         self.message = _Message(content)
+        self.finish_reason = finish_reason
 
 
 class _Response:
-    def __init__(self, content):
-        self.choices = [_Choice(content)]
+    def __init__(self, content, finish_reason="stop"):
+        self.choices = [_Choice(content, finish_reason)]
 
 
 class _FakeCompletions:
@@ -322,6 +324,164 @@ class OptimizeChunkContextTests(unittest.IsolatedAsyncioTestCase):
         raw = "这是不可丢失的原始正文" * 50
         out = s._maybe_overall_fallback("", raw)
         self.assertIn("这是不可丢失的原始正文", out)
+
+
+class LosslessOptimizeTests(unittest.IsolatedAsyncioTestCase):
+    def _make_summarizer(self, responder):
+        summarizer = Summarizer(api_key="sk-test-dummy")
+        self.calls = []
+        summarizer.client = _FakeClient(self.calls, responder)
+        return summarizer
+
+    @staticmethod
+    def _request_payload(kwargs):
+        return json.loads(kwargs["messages"][-1]["content"])
+
+    @classmethod
+    def _echo_response(cls, kwargs):
+        request = cls._request_payload(kwargs)
+        return _Response(json.dumps({
+            "segments": [
+                {"id": segment["id"], "text": segment["text"]}
+                for segment in request["segments"]
+            ]
+        }, ensure_ascii=False))
+
+    async def test_lossless_optimizer_restores_empty_segment(self):
+        def responder(kwargs):
+            request = self._request_payload(kwargs)
+            response_segments = [
+                {"id": segment["id"], "text": segment["text"]}
+                for segment in request["segments"]
+            ]
+            response_segments[0]["text"] = ""
+            return _Response(json.dumps({"segments": response_segments}, ensure_ascii=False))
+
+        summarizer = self._make_summarizer(responder)
+        source = "开场白绝对不能丢失" * 100
+        result = await summarizer.optimize_transcript_body(source, "zh")
+        self.assertIn("开场白绝对不能丢失", result)
+        audit = summarizer.get_last_optimization_audit()
+        self.assertGreaterEqual(audit["status_counts"].get("fallback_empty", 0), 1)
+
+    async def test_lossless_optimizer_splits_truncated_batch(self):
+        call_count = {"value": 0}
+
+        def responder(kwargs):
+            call_count["value"] += 1
+            if call_count["value"] == 1:
+                return _Response("", finish_reason="length")
+            return self._echo_response(kwargs)
+
+        summarizer = self._make_summarizer(responder)
+        source = "这一段内容用于测试截断后拆分批次" * 180
+        result = await summarizer.optimize_transcript_body(source, "zh")
+        self.assertIn("这一段内容用于测试截断后拆分批次", result)
+        self.assertGreaterEqual(call_count["value"], 3)
+        self.assertNotIn("fallback_finish_reason", summarizer.get_last_optimization_audit()["status_counts"])
+
+    async def test_lossless_optimizer_rejects_summary_rewrite(self):
+        def responder(kwargs):
+            request = self._request_payload(kwargs)
+            return _Response(json.dumps({
+                "segments": [
+                    {"id": segment["id"], "text": "本段主要讨论访谈主题。" * 50}
+                    for segment in request["segments"]
+                ]
+            }, ensure_ascii=False))
+
+        summarizer = self._make_summarizer(responder)
+        source = "主持人的开场寒暄引用举例和详细论述都必须保留" * 100
+        result = await summarizer.optimize_transcript_body(source, "zh")
+        self.assertIn("主持人的开场寒暄引用举例和详细论述都必须保留", result)
+        audit = summarizer.get_last_optimization_audit()
+        self.assertGreater(audit["status_counts"].get("fallback_fidelity", 0), 0)
+
+    async def test_audit_contains_metadata_not_transcript(self):
+        summarizer = self._make_summarizer(self._echo_response)
+        source = "审计中不能保存完整正文" * 80
+        await summarizer.optimize_transcript_body(source, "zh")
+        audit = summarizer.get_last_optimization_audit()
+        json.dumps(audit, ensure_ascii=False)
+        serialized = json.dumps(audit, ensure_ascii=False)
+        self.assertNotIn(source, serialized)
+        self.assertNotIn("source_text", serialized)
+        self.assertNotIn("candidate_text", serialized)
+        self.assertIn("source_hash", serialized)
+
+    async def test_historical_21_segment_empty_pattern_preserves_every_block(self):
+        empty_indexes = {1, 3, 4, 12, 13, 14, 16, 20}
+
+        def responder(kwargs):
+            request = self._request_payload(kwargs)
+            response_segments = []
+            for segment in request["segments"]:
+                index = int(segment["id"].split("-")[1])
+                response_segments.append({
+                    "id": segment["id"],
+                    "text": "" if index in empty_indexes else segment["text"],
+                })
+            return _Response(
+                json.dumps({"segments": response_segments}, ensure_ascii=False)
+            )
+
+        summarizer = self._make_summarizer(responder)
+        blocks = []
+        for index in range(21):
+            marker = f"历史片段{index:02d}不可丢失"
+            blocks.append((marker + "正文内容必须完整保留" * 40)[:300])
+        source = "".join(blocks)
+
+        result = await summarizer.optimize_transcript_body(source, "zh")
+
+        for index in range(21):
+            self.assertIn(f"历史片段{index:02d}不可丢失", result)
+        audit = summarizer.get_last_optimization_audit()
+        self.assertEqual(audit["segment_count"], 21)
+        self.assertEqual(audit["status_counts"].get("fallback_empty"), 8)
+
+
+class TranscriptBodyTests(unittest.TestCase):
+    def test_extract_body_removes_english_metadata(self):
+        raw = """# Video Transcription
+
+**Detected Language:** woitn
+**Language Probability:** —
+
+## Transcription Content
+
+hello 大家好这是正文
+"""
+        self.assertEqual(
+            Summarizer.extract_transcript_body(raw),
+            "hello 大家好这是正文",
+        )
+
+    def test_extract_body_removes_chinese_metadata(self):
+        raw = """# 视频转录
+
+**检测语言:** zh
+**语言概率:** 0.99
+
+## 转录内容
+
+这是正文
+"""
+        self.assertEqual(Summarizer.extract_transcript_body(raw), "这是正文")
+
+    def test_extract_body_removes_timestamps_only(self):
+        raw = (
+            "**[00:00 - 00:05]**\n\n第一段\n\n"
+            "**[00:05 - 00:10]**\n\n第二段"
+        )
+        self.assertEqual(
+            Summarizer.extract_transcript_body(raw),
+            "第一段\n\n第二段",
+        )
+
+    def test_extract_body_preserves_unrecognized_markdown_content(self):
+        raw = "## 用户自己的标题\n\n正文 **强调内容** 不得删除"
+        self.assertEqual(Summarizer.extract_transcript_body(raw), raw)
 
 
 if __name__ == "__main__":
