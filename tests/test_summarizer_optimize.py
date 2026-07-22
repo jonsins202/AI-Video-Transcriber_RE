@@ -131,6 +131,17 @@ class OptimizeChunkContextTests(unittest.IsolatedAsyncioTestCase):
         body = _extract_body(kwargs["messages"][-1]["content"])
         return _Response(body[:len(body) // 2])
 
+    @staticmethod
+    def _empty_first_responder_factory():
+        calls = {"count": 0}
+
+        def responder(kwargs):
+            calls["count"] += 1
+            body = _extract_body(kwargs["messages"][-1]["content"])
+            return _Response("" if calls["count"] == 1 else body)
+
+        return responder
+
     # ===== _strip_context_echo 单元 =====
 
     def test_strip_context_echo_word_for_word(self):
@@ -281,6 +292,14 @@ class OptimizeChunkContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(len(result), len(text) * 0.8,
                            "过度精简未被单块兜底拦截，内容大量丢失")
 
+    async def test_empty_chunk_falls_back_to_original(self):
+        s = self._make_summarizer(self._empty_first_responder_factory())
+        text = "甲" * 4000 + "乙" * 4000 + "丙" * 4000
+        result = await s._format_long_transcript_in_chunks(text, "zh", 4000)
+        self.assertIn("甲" * 100, result)
+        self.assertIn("乙" * 100, result)
+        self.assertIn("丙" * 100, result)
+
     # ===== 整体长度兜底（单块兜底失效时的最后防线）=====
 
     def test_maybe_overall_fallback_triggers_when_short(self):
@@ -297,6 +316,12 @@ class OptimizeChunkContextTests(unittest.IsolatedAsyncioTestCase):
         merged_ok = raw + "额外保留的内容。"  # > 100% → 不应触发
         out = s._maybe_overall_fallback(merged_ok, raw)
         self.assertEqual(out, merged_ok)
+
+    def test_empty_overall_result_falls_back(self):
+        s = Summarizer(api_key="sk-test-dummy")
+        raw = "这是不可丢失的原始正文" * 50
+        out = s._maybe_overall_fallback("", raw)
+        self.assertIn("这是不可丢失的原始正文", out)
 
 
 if __name__ == "__main__":

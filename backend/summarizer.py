@@ -312,7 +312,10 @@ class Summarizer:
         宁可不优化也不丢段（task:1128f3 即严重丢失案例：块3跳段丢 ~4000 字核心论述）。
         正常优化长度基本持平或略增（修错别字+分段），threshold=0.60 不会误触发。
         """
-        if merged.strip() and len(merged.strip()) < len(raw_transcript) * threshold:
+        if not merged.strip():
+            logger.warning("优化后整体为空，整体使用原文兜底")
+            return self._apply_basic_formatting(raw_transcript)
+        if len(merged.strip()) < len(raw_transcript) * threshold:
             ratio_pct = len(merged.strip()) * 100 // max(1, len(raw_transcript))
             logger.warning(
                 f"优化后整体过短（{len(merged.strip())} vs 原始 {len(raw_transcript)}，"
@@ -421,7 +424,10 @@ class Summarizer:
                     oc = self._strip_context_echo(oc, prev_context)
                 # 质量校验：LLM 偶发过度精简（把正文当冗余删，如开场介绍）。若优化后明显短于原始（<70%）
                 # 疑丢内容 → 用原始块基础格式化兜底（保留全部内容，宁可不优化也不丢段）
-                if oc.strip() and len(oc.strip()) < len(c.strip()) * 0.7:
+                if not oc.strip():
+                    logger.warning(f"第 {i+1} 块优化结果为空，使用原始块兜底")
+                    oc = self._apply_basic_formatting(c)
+                elif len(oc.strip()) < len(c.strip()) * 0.7:
                     logger.warning(f"第 {i+1} 块优化后异常短（{len(oc.strip())} vs 原始 {len(c.strip())}），疑丢内容，用原始块兜底")
                     oc = self._apply_basic_formatting(c)
                 optimized.append(oc)
