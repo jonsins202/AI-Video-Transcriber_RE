@@ -71,3 +71,6 @@ cookies.txt
 # Model cache
 models/
 .cache/
+
+# Isolated development worktrees
+.worktrees/
