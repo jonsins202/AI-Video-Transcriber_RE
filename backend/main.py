@@ -319,6 +319,10 @@ async def _run_post_extract_pipeline(
 
     tasks[task_id].update(task_result)
     save_tasks(tasks)
+    # 记录完成时间 + 总耗时（前端展示用）
+    from datetime import datetime
+    tasks[task_id]["completed_at"] = datetime.now().isoformat(timespec="seconds")
+    tasks[task_id]["total_duration"] = round(sum((tasks[task_id].get("timeline") or {}).values()), 1)
     logger.info(f"任务完成，准备广播最终状态: {task_id}")
     await broadcast_task_update(task_id, tasks[task_id])
     logger.info(f"最终状态已广播: {task_id}")
