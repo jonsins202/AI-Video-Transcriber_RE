@@ -175,6 +175,12 @@ def _txt_to_raw_transcript_markdown(body: str) -> str:
     ])
 
 
+async def _write_optimization_audit(path: Path, audit: dict) -> None:
+    """将不含正文的优化审计元数据写入 JSON。"""
+    async with aiofiles.open(path, "w", encoding="utf-8") as f:
+        await f.write(json.dumps(audit, ensure_ascii=False, indent=2))
+
+
 async def _run_post_extract_pipeline(
     task_id: str,
     raw_script: str,
@@ -199,8 +205,9 @@ async def _run_post_extract_pipeline(
         tasks[task_id].update({"raw_script_file": raw_md_filename})
         save_tasks(tasks)
         await broadcast_task_update(task_id, tasks[task_id])
-    except Exception as e:
-        logger.error(f"保存原始转录Markdown失败: {e}")
+    except Exception:
+        logger.exception("保存原始转录 Markdown 失败，停止后续优化")
+        raise
 
     tasks[task_id].update({
         "progress": 55,
@@ -209,8 +216,19 @@ async def _run_post_extract_pipeline(
     save_tasks(tasks)
     await broadcast_task_update(task_id, tasks[task_id])
 
+    transcript_body = request_summarizer.extract_transcript_body(raw_script)
     with _stage(task_id, "optimize"):
-        script = await request_summarizer.optimize_transcript(raw_script)
+        script = await request_summarizer.optimize_transcript_body(transcript_body)
+
+    audit = request_summarizer.get_last_optimization_audit()
+    if audit:
+        try:
+            audit_filename = f"optimization_audit_{safe_title}_{short_id}.json"
+            await _write_optimization_audit(TEMP_DIR / audit_filename, audit)
+            tasks[task_id]["optimization_audit_file"] = audit_filename
+            save_tasks(tasks)
+        except Exception:
+            logger.exception("保存无损优化审计失败，不影响转录结果")
 
     script_with_title = f"# {video_title}\n\n{script}\n\nsource: {source_ref}\n"
 
