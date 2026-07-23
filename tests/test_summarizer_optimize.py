@@ -18,8 +18,12 @@ mock 掉 OpenAI client（不依赖真实 API），覆盖：
 import os
 import sys
 import json
+import time
+import threading
 import unittest
-from unittest.mock import patch
+import httpx
+import openai
+from unittest.mock import patch, AsyncMock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "backend"))
 
@@ -365,20 +369,23 @@ class LosslessOptimizeTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(audit["status_counts"].get("fallback_empty", 0), 1)
 
     async def test_lossless_optimizer_splits_truncated_batch(self):
-        call_count = {"value": 0}
+        # pin 到串行：mock create 在真实线程里跑，共享 call_count 非原子、"首调"非确定，
+        # 并发下断言不可靠。该测试聚焦二分拆分逻辑本身，与并发无关。
+        with patch.dict(os.environ, {"LOSSLESS_CONCURRENCY": "1"}):
+            call_count = {"value": 0}
 
-        def responder(kwargs):
-            call_count["value"] += 1
-            if call_count["value"] == 1:
-                return _Response("", finish_reason="length")
-            return self._echo_response(kwargs)
+            def responder(kwargs):
+                call_count["value"] += 1
+                if call_count["value"] == 1:
+                    return _Response("", finish_reason="length")
+                return self._echo_response(kwargs)
 
-        summarizer = self._make_summarizer(responder)
-        source = "这一段内容用于测试截断后拆分批次" * 180
-        result = await summarizer.optimize_transcript_body(source, "zh")
-        self.assertIn("这一段内容用于测试截断后拆分批次", result)
-        self.assertGreaterEqual(call_count["value"], 3)
-        self.assertNotIn("fallback_finish_reason", summarizer.get_last_optimization_audit()["status_counts"])
+            summarizer = self._make_summarizer(responder)
+            source = "这一段内容用于测试截断后拆分批次" * 180
+            result = await summarizer.optimize_transcript_body(source, "zh")
+            self.assertIn("这一段内容用于测试截断后拆分批次", result)
+            self.assertGreaterEqual(call_count["value"], 3)
+            self.assertNotIn("fallback_finish_reason", summarizer.get_last_optimization_audit()["status_counts"])
 
     async def test_lossless_optimizer_rejects_summary_rewrite(self):
         def responder(kwargs):
@@ -439,6 +446,73 @@ class LosslessOptimizeTests(unittest.IsolatedAsyncioTestCase):
         audit = summarizer.get_last_optimization_audit()
         self.assertEqual(audit["segment_count"], 21)
         self.assertEqual(audit["status_counts"].get("fallback_empty"), 8)
+
+    async def test_lossless_concurrent_equivalence_and_bounded(self):
+        """并发：实测并发度受 Semaphore 约束，且结果与串行完全一致。"""
+        lock = threading.Lock()
+        state = {"in_flight": 0, "max_in_flight": 0}
+
+        def responder(kwargs):
+            with lock:
+                state["in_flight"] += 1
+                state["max_in_flight"] = max(state["max_in_flight"], state["in_flight"])
+            time.sleep(0.05)  # 强制重叠让并发可观测
+            with lock:
+                state["in_flight"] -= 1
+            return self._echo_response(kwargs)
+
+        source = "并发等价校验每一批必须独立且结果稳定不丢" * 300
+
+        with patch.dict(os.environ, {"LOSSLESS_CONCURRENCY": "3"}):
+            summarizer_cc = self._make_summarizer(responder)
+            result_cc = await summarizer_cc.optimize_transcript_body(source, "zh")
+
+        self.assertGreaterEqual(state["max_in_flight"], 2)  # 确实并发了
+        self.assertLessEqual(state["max_in_flight"], 3)     # 受 Semaphore 约束
+
+        with patch.dict(os.environ, {"LOSSLESS_CONCURRENCY": "1"}):
+            summarizer_ser = self._make_summarizer(self._echo_response)
+            result_ser = await summarizer_ser.optimize_transcript_body(source, "zh")
+
+        self.assertEqual(result_cc, result_ser)  # 并发结果 == 串行结果
+
+    async def test_lossless_429_backoff_recovers(self):
+        """429：前两次限流，退避重试后恢复，正文保留。"""
+        call_count = {"value": 0}
+
+        def responder(kwargs):
+            call_count["value"] += 1
+            if call_count["value"] <= 2:
+                resp = httpx.Response(429, request=httpx.Request("POST", "https://x"))
+                raise openai.RateLimitError("rate limited", response=resp, body=None)
+            return self._echo_response(kwargs)
+
+        summarizer = self._make_summarizer(responder)
+        source = "限流后应能通过退避重试恢复并完整保留正文" * 150
+
+        with patch.dict(os.environ, {"LOSSLESS_CONCURRENCY": "1"}), \
+             patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            result = await summarizer.optimize_transcript_body(source, "zh")
+
+        self.assertIn("限流后应能通过退避重试恢复并完整保留正文", result)
+        self.assertGreaterEqual(mock_sleep.await_count, 2)
+
+    async def test_lossless_429_exhausted_falls_back_to_original(self):
+        """429：持续限流耗尽重试后回退原文，不丢内容。"""
+        def responder(kwargs):
+            resp = httpx.Response(429, request=httpx.Request("POST", "https://x"))
+            raise openai.RateLimitError("rate limited", response=resp, body=None)
+
+        summarizer = self._make_summarizer(responder)
+        source = "持续限流时必须回退原文且不得丢失任何内容" * 150
+
+        with patch.dict(os.environ, {"LOSSLESS_CONCURRENCY": "1"}), \
+             patch("asyncio.sleep", new_callable=AsyncMock):
+            result = await summarizer.optimize_transcript_body(source, "zh")
+
+        self.assertIn("持续限流时必须回退原文且不得丢失任何内容", result)
+        audit = summarizer.get_last_optimization_audit()
+        self.assertGreater(audit["status_counts"].get("fallback_api", 0), 0)
 
 
 class TranscriptBodyTests(unittest.TestCase):

@@ -8,6 +8,14 @@ import sys
 import subprocess
 from pathlib import Path
 
+# Windows GBK 控制台下，含 emoji 的 print 会触发 UnicodeEncodeError 直接崩溃，
+# 这里把 stdout/stderr 强制成 UTF-8（无法表示的字符替换为 ?，绝不抛异常）
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 def check_dependencies():
     """检查依赖是否安装"""
     import sys
@@ -15,6 +23,7 @@ def check_dependencies():
         "fastapi": "fastapi",
         "uvicorn": "uvicorn",
         "yt-dlp": "yt_dlp",
+        "funasr": "funasr",
         "qwen-asr": "qwen_asr",
         "openai": "openai"
     }
@@ -68,11 +77,26 @@ def setup_environment():
         os.environ["OPENAI_BASE_URL"] = "https://oneapi.basevec.com/v1"
         print("✅ 已设置OpenAI Base URL")
     
-    # 设置 Qwen3-ASR 模型路径
+    # 设置 Qwen3-ASR 模型路径（备选后端）
     if not os.getenv("QWEN3_ASR_MODEL_PATH"):
         default_model = str(Path(__file__).parent / "models" / "Qwen3-ASR-0.6B")
         os.environ["QWEN3_ASR_MODEL_PATH"] = default_model
-    
+
+    # ASR 后端默认配置（FunASR 为默认；改 ASR_BACKEND=qwen 切回 Qwen3-ASR）
+    os.environ.setdefault("ASR_BACKEND", "funasr")
+    os.environ.setdefault("FUNASR_MODEL", "paraformer")
+    os.environ.setdefault("FUNASR_DEVICE", "cuda")
+    os.environ.setdefault("FUNASR_VAD_MODEL", "fsmn-vad")
+    os.environ.setdefault("FUNASR_BATCH_SIZE_S", "300")
+    # 摘要分块并发数
+    os.environ.setdefault("SUMMARY_CONCURRENCY", "6")
+    # 无损优化并发数（DeepSeek 账号级并发上限 500，32 并发安全；受 asyncio 线程池 min(32,cpu+4) 限制）
+    os.environ.setdefault("LOSSLESS_CONCURRENCY", "32")
+    _be = os.getenv("ASR_BACKEND", "funasr")
+    _detail = f" ({os.getenv('FUNASR_MODEL')})" if _be == "funasr" else ""
+    print(f"🎙  ASR 后端: {_be}{_detail}")
+    print(f"⚙  并发: 无损优化={os.getenv('LOSSLESS_CONCURRENCY')}  摘要={os.getenv('SUMMARY_CONCURRENCY')}")
+
     print("🔑 OpenAI API已配置，摘要功能可用")
     return True
 

@@ -161,7 +161,7 @@ _SENSEVOICE_LANG_TAG = {
 
 
 class _FunASRBackend:
-    """FunASR 后端。模型由 FUNASR_MODEL 选择：sensevoice（默认）/ paraformer / 自定义 repo id。"""
+    """FunASR 后端。模型由 FUNASR_MODEL 选择：paraformer（默认）/ sensevoice / 自定义 repo id。"""
 
     def __init__(self):
         self.model = None
@@ -172,7 +172,7 @@ class _FunASRBackend:
             return
         from funasr import AutoModel
 
-        kind = (os.getenv("FUNASR_MODEL", "sensevoice").strip().lower() or "sensevoice")
+        kind = (os.getenv("FUNASR_MODEL", "paraformer").strip().lower() or "paraformer")
         device = os.getenv("FUNASR_DEVICE", "cuda").strip() or "cuda"
         vad = os.getenv("FUNASR_VAD_MODEL", "fsmn-vad").strip() or None
 
@@ -228,18 +228,55 @@ class _FunASRBackend:
             lang = lang_arg
 
         # Paraformer 返回 sentence_info（带毫秒时间戳）；SenseVoice 无（纯文本）
+        # 把句级片段聚合成段落，避免逐句换行造成阅读频繁滚动：
+        # 句间停顿超过阈值（说话人换气/换话题）或累积字数超上限才分段。
         segments: List[Segment] = []
         si = r.get("sentence_info")
         if si:
+            try:
+                pause_threshold = float(os.getenv("FUNASR_PARAGRAPH_PAUSE", "1.5"))
+            except (ValueError, TypeError):
+                pause_threshold = 1.5
+            try:
+                length_limit = int(os.getenv("FUNASR_PARAGRAPH_CHARS", "300"))
+            except (ValueError, TypeError):
+                length_limit = 300
+
+            para_texts: List[str] = []
+            para_start = 0
+            para_end = 0
+            para_len = 0
+
+            def _flush_para() -> None:
+                nonlocal para_texts, para_start, para_end, para_len
+                if para_texts:
+                    segments.append(Segment(
+                        start_fmt=_format_time_ms(para_start),
+                        end_fmt=_format_time_ms(para_end),
+                        text="".join(para_texts),
+                    ))
+                    para_texts = []
+                    para_start = 0
+                    para_end = 0
+                    para_len = 0
+
             for s in si:
                 seg_text = (s.get("sentence") or s.get("text") or "").strip()
                 if not seg_text:
                     continue
-                segments.append(Segment(
-                    start_fmt=_format_time_ms(s.get("start", 0)),
-                    end_fmt=_format_time_ms(s.get("end", 0)),
-                    text=seg_text,
-                ))
+                s_start = int(s.get("start", 0) or 0)
+                s_end = int(s.get("end", 0) or 0)
+                if para_texts and (
+                    (s_start - para_end) / 1000.0 > pause_threshold
+                    or para_len >= length_limit
+                ):
+                    _flush_para()
+                if not para_texts:
+                    para_start = s_start
+                para_texts.append(seg_text)
+                para_end = s_end
+                para_len += len(seg_text)
+            _flush_para()
 
         if not text and segments:
             text = " ".join(s.text for s in segments)

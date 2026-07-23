@@ -5,7 +5,8 @@ import asyncio
 from collections import Counter
 import json
 import re
-from typing import Optional
+import random
+from typing import Optional, Callable, Awaitable
 
 from llm_sanitize import strip_llm_artifacts
 from lossless_optimizer import (
@@ -81,7 +82,10 @@ class Summarizer:
         return await self.optimize_transcript_body(body)
 
     async def optimize_transcript_body(
-        self, body: str, transcript_language: Optional[str] = None
+        self,
+        body: str,
+        transcript_language: Optional[str] = None,
+        on_progress: Optional[Callable[[int, int], Awaitable[None]]] = None,
     ) -> str:
         """严格无损优化纯正文；任何未验证段均回退原文。"""
         if not body:
@@ -96,7 +100,7 @@ class Summarizer:
             return body
         language = transcript_language or self._detect_transcript_language(body)
         try:
-            return await self._optimize_lossless_body(body, language)
+            return await self._optimize_lossless_body(body, language, on_progress=on_progress)
         except Exception:
             logger.exception("无损优化管线异常，返回完整原文")
             self.last_optimization_audit = {
@@ -144,40 +148,75 @@ class Summarizer:
             "只输出一个 JSON 对象：{\"segments\":[{\"id\":\"...\",\"text\":\"...\"}]}。"
             f"正文语言：{language or 'unknown'}。"
         )
-        try:
-            response = await asyncio.to_thread(
-                self.client.chat.completions.create,
-                model=self.fast_model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {
-                        "role": "user",
-                        "content": json.dumps(request_payload, ensure_ascii=False),
-                    },
-                ],
-                max_tokens=5000,
-                temperature=0.0,
-            )
-            if not getattr(response, "choices", None):
-                return {"ok": False, "reason": "missing_choice"}
-            choice = response.choices[0]
-            finish_reason = getattr(choice, "finish_reason", None)
-            if finish_reason != "stop":
+        max_retries = 3
+        base_delay = 2.0
+        cap_delay = 20.0
+        for attempt in range(max_retries + 1):
+            try:
+                response = await asyncio.to_thread(
+                    self.client.chat.completions.create,
+                    model=self.fast_model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {
+                            "role": "user",
+                            "content": json.dumps(request_payload, ensure_ascii=False),
+                        },
+                    ],
+                    max_tokens=5000,
+                    temperature=0.0,
+                )
+                if not getattr(response, "choices", None):
+                    return {"ok": False, "reason": "missing_choice"}
+                choice = response.choices[0]
+                finish_reason = getattr(choice, "finish_reason", None)
+                if finish_reason != "stop":
+                    return {
+                        "ok": False,
+                        "reason": "finish_reason",
+                        "finish_reason": finish_reason,
+                    }
+                content = getattr(getattr(choice, "message", None), "content", "") or ""
+                if not content.strip():
+                    return {"ok": False, "reason": "empty_response"}
                 return {
-                    "ok": False,
-                    "reason": "finish_reason",
+                    "ok": True,
+                    "payload": self._extract_json_object(content),
                     "finish_reason": finish_reason,
                 }
-            content = getattr(getattr(choice, "message", None), "content", "") or ""
-            if not content.strip():
-                return {"ok": False, "reason": "empty_response"}
-            return {
-                "ok": True,
-                "payload": self._extract_json_object(content),
-                "finish_reason": finish_reason,
-            }
-        except Exception as exc:
-            return {"ok": False, "reason": "api_or_json", "error": str(exc)}
+            except openai.RateLimitError as exc:
+                if attempt >= max_retries:
+                    return {"ok": False, "reason": "rate_limited", "error": str(exc)}
+                delay = self._compute_backoff(exc, attempt, base_delay, cap_delay)
+                logger.warning(
+                    f"无损优化批次被限流(429)，{delay:.1f}s 后重试 "
+                    f"(attempt {attempt + 1}/{max_retries})"
+                )
+                await asyncio.sleep(delay)
+                continue
+            except Exception as exc:
+                return {"ok": False, "reason": "api_or_json", "error": str(exc)}
+        return {"ok": False, "reason": "rate_limited", "error": "exhausted"}
+
+    @staticmethod
+    def _compute_backoff(
+        exc: Exception, attempt: int, base_delay: float, cap_delay: float
+    ) -> float:
+        """429 退避时长：优先 honor Retry-After，否则指数退避 + full jitter。"""
+        retry_after = None
+        resp = getattr(exc, "response", None)
+        headers = getattr(resp, "headers", None)
+        if headers is not None:
+            raw = headers.get("retry-after")
+            if raw is not None:
+                try:
+                    retry_after = float(raw)
+                except (TypeError, ValueError):
+                    retry_after = None  # 忽略 HTTP-date 形式
+        computed = min(cap_delay, base_delay * (2 ** attempt))
+        # retry_after 也用 cap 兜底，防病态巨大值（如 3600）让单批槽位阻塞过久
+        delay = max(computed, min(retry_after or 0.0, cap_delay))
+        return delay + random.uniform(0.0, 1.0)  # full jitter，避免惊群
 
     async def _process_lossless_batch(
         self, batch: SegmentBatch, language: str, allow_split: bool = True
@@ -198,11 +237,16 @@ class Summarizer:
             )
             return decisions
         if not result.get("ok"):
-            retry = await self._call_lossless_batch(batch, language)
-            if retry.get("ok"):
-                result = retry
-            else:
-                reason = retry.get("reason") or result.get("reason") or "unknown"
+            fail_reason = result.get("reason")
+            # rate_limited 已在 _call_lossless_batch 内退避重试过，这里跳过立即重试避免双重退避
+            if fail_reason != "rate_limited":
+                retry = await self._call_lossless_batch(batch, language)
+                if retry.get("ok"):
+                    result = retry
+                else:
+                    fail_reason = retry.get("reason") or fail_reason
+            if not result.get("ok"):
+                reason = fail_reason or result.get("reason") or "unknown"
                 status = (
                     "fallback_finish_reason"
                     if reason == "finish_reason"
@@ -211,7 +255,12 @@ class Summarizer:
                 return fallback_batch(batch.segments, status, reason)
         return evaluate_batch_response(batch.segments, result["payload"])
 
-    async def _optimize_lossless_body(self, body: str, language: str) -> str:
+    async def _optimize_lossless_body(
+        self,
+        body: str,
+        language: str,
+        on_progress: Optional[Callable[[int, int], Awaitable[None]]] = None,
+    ) -> str:
         segments = split_source_segments(body)
         batches = build_batches(body, segments)
         decisions = {}
@@ -222,12 +271,41 @@ class Summarizer:
                     fallback_batch(batch.segments, "fallback_api", "client_unavailable")
                 )
         else:
+            try:
+                concurrency = max(1, min(int(os.getenv("LOSSLESS_CONCURRENCY", "32")), 32))
+            except (ValueError, TypeError):
+                concurrency = 32
+            sem = asyncio.Semaphore(concurrency)
+            total = len(batches)
+            completed = 0
             logger.info(
-                f"无损优化: {len(segments)} 段, {len(batches)} 批, 串行处理"
+                f"无损优化: {len(segments)} 段, {total} 批, 并发 {concurrency}"
             )
-            for index, batch in enumerate(batches, 1):
-                logger.info(f"无损优化批次 {index}/{len(batches)}")
-                decisions.update(await self._process_lossless_batch(batch, language))
+
+            async def _run_one(idx: int, batch: SegmentBatch) -> dict:
+                nonlocal completed
+                # 关键：信号量包顶层 _process_lossless_batch，不包 _call_lossless_batch，
+                # 否则递归二分会重复占槽位、压垮有效并发。
+                async with sem:
+                    try:
+                        result = await self._process_lossless_batch(batch, language)
+                    except Exception:
+                        logger.exception(f"无损优化批次 {idx}/{total} 异常，回退原文")
+                        result = fallback_batch(batch.segments, "fallback_api", "exception")
+                completed += 1
+                logger.info(f"无损优化批次 {idx}/{total} 完成")
+                if on_progress is not None:
+                    try:
+                        await on_progress(completed, total)
+                    except Exception:
+                        logger.debug("无损优化进度回调异常，忽略")
+                return result
+
+            batch_results = list(await asyncio.gather(
+                *[_run_one(i, b) for i, b in enumerate(batches, 1)]
+            ))
+            for r in batch_results:
+                decisions.update(r)
 
         status_counts = Counter(decision.status for decision in decisions.values())
         self.last_optimization_audit = {

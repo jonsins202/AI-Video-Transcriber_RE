@@ -481,7 +481,7 @@ class VideoTranscriber {
 
         if (task.status === 'completed') {
           this._stopSP(); this._stopSSE(); this._setLoading(false); this._hideProgress();
-          this._showResults(task.script, task.summary, task.video_title, task.translation, task.detected_language, task.summary_language);
+          this._showResults(task.script, task.summary, task.video_title, task.translation, task.detected_language, task.summary_language, task.timeline, task.completed_at, task.total_duration);
         } else if (task.status === 'error') {
           this._stopSP(); this._stopSSE(); this._setLoading(false); this._hideProgress();
           this._showError(task.error || 'Processing error');
@@ -498,7 +498,7 @@ class VideoTranscriber {
             const task = await r.json();
             if (task?.status === 'completed') {
               this._stopSP(); this._setLoading(false); this._hideProgress();
-              this._showResults(task.script, task.summary, task.video_title, task.translation, task.detected_language, task.summary_language);
+              this._showResults(task.script, task.summary, task.video_title, task.translation, task.detected_language, task.summary_language, task.timeline, task.completed_at, task.total_duration);
               return;
             }
           }
@@ -671,7 +671,7 @@ class VideoTranscriber {
     return c;
   }
 
-  _showResults(script, summary, videoTitle, translation, detectedLang, summaryLang) {
+  _showResults(script, summary, videoTitle, translation, detectedLang, summaryLang, timeline, completedAt, totalDuration) {
     this.scriptContent.innerHTML  = script    ? marked.parse(script)      : '';
     this.summaryContent.innerHTML = summary   ? marked.parse(summary)     : '';
 
@@ -687,12 +687,46 @@ class VideoTranscriber {
       this.dlTranslation.style.display      = 'none';
     }
 
+    this._renderTaskMeta(timeline, completedAt, totalDuration);
     this.resultsPanel.classList.add('show');
     this._switchTab('script');
     this.resultsPanel.scrollIntoView({ behavior: 'smooth', block: 'start' });
   }
 
   _hideResults() { this.resultsPanel.classList.remove('show'); }
+
+  /* ── Task meta（完成时间/耗时展示）── */
+  _renderTaskMeta(timeline, completedAt, totalDuration) {
+    let meta = document.getElementById('taskMeta');
+    if (!meta) {
+      meta = document.createElement('div');
+      meta.id = 'taskMeta';
+      meta.style.cssText = 'font-size:13px;color:#5a6372;margin:10px 0 4px;padding:9px 14px;background:linear-gradient(90deg,#f3f6fb,#faf5ff);border:1px solid #e6ecf5;border-radius:8px;line-height:1.7;';
+      this.resultsPanel.insertBefore(meta, this.resultsPanel.firstChild);
+    }
+    const parts = [];
+    if (totalDuration) parts.push(`⏱ <b style="color:#2c3e50">总耗时 ${this._fmtDuration(totalDuration)}</b>`);
+    if (timeline && typeof timeline === 'object') {
+      const order = ['audio_download', 'transcribe', 'optimize', 'summarize', 'translate'];
+      const segs = order.filter(s => timeline[s]).map(s => `${this._stageLabel(s)} ${this._fmtDuration(timeline[s])}`);
+      if (segs.length) parts.push(`<span style="color:#7a8699">${segs.join(' · ')}</span>`);
+    }
+    if (completedAt) parts.push(`✓ 完成于 ${this._fmtTime(completedAt)}`);
+    meta.innerHTML = parts.join('<br>');
+  }
+  _fmtDuration(sec) {
+    sec = Math.round(Number(sec) || 0);
+    if (sec < 60) return `${sec}秒`;
+    const m = Math.floor(sec / 60), s = sec % 60;
+    return s ? `${m}分${s}秒` : `${m}分钟`;
+  }
+  _fmtTime(iso) {
+    try { return new Date(iso).toLocaleTimeString('zh-CN', { hour12: false }); }
+    catch { return String(iso); }
+  }
+  _stageLabel(s) {
+    return { subtitle_fetch: '字幕', audio_download: '下载', transcribe: '转录', optimize: '优化', summarize: '摘要', translate: '翻译' }[s] || s;
+  }
 
   /* ── Tabs ─────────────────────────────────────────────── */
   _switchTab(name) {

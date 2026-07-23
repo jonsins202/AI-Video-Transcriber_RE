@@ -181,6 +181,27 @@ async def _write_optimization_audit(path: Path, audit: dict) -> None:
         await f.write(json.dumps(audit, ensure_ascii=False, indent=2))
 
 
+def _make_optimize_progress_callback(task_id: str, start: int = 55, end: int = 68):
+    """构造 on_progress(done, total)：把无损优化批次完成进度映射到 start→end 的进度条。
+
+    单调保护：asyncio 单线程下 completed+=1 到写 progress 之间无 await，再加
+    pct<=当前值则跳过，确保进度绝不倒退。end=68 给后续 translate(70)/summarize(80) 留空间。"""
+    async def _on_progress(done: int, total: int) -> None:
+        if total <= 0:
+            return
+        pct = start + round((done / total) * (end - start))
+        task = tasks.get(task_id)
+        if task is None:
+            return
+        if pct <= task.get("progress", 0):
+            return
+        task["progress"] = pct
+        task["message"] = f"正在优化转录文本... ({done}/{total})"
+        save_tasks(tasks)
+        await broadcast_task_update(task_id, task)
+    return _on_progress
+
+
 async def _run_post_extract_pipeline(
     task_id: str,
     raw_script: str,
@@ -218,7 +239,10 @@ async def _run_post_extract_pipeline(
 
     transcript_body = request_summarizer.extract_transcript_body(raw_script)
     with _stage(task_id, "optimize"):
-        script = await request_summarizer.optimize_transcript_body(transcript_body)
+        script = await request_summarizer.optimize_transcript_body(
+            transcript_body,
+            on_progress=_make_optimize_progress_callback(task_id),
+        )
 
     audit = request_summarizer.get_last_optimization_audit()
     if audit:
