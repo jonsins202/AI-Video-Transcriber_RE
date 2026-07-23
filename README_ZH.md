@@ -14,7 +14,7 @@
 
 ## 与上游的主要差异
 
-本仓库是 [wendy7756/AI-Video-Transcriber](https://github.com/wendy7756/AI-Video-Transcriber) 的二次开发版本（RE 版本）。核心改进：
+本仓库是 [wendy7756/AI-Video-Transcriber](https://github.com/wendy7756/AI-Video-Transcriber) 的二次开发版本（RE = Re-Edit，再编辑版）。核心改进：
 
 | 改进点 | 上游原版 | RE 版本 |
 |--------|----------|---------|

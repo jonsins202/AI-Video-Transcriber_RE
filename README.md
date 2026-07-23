@@ -7,7 +7,7 @@ English | [中文](README_ZH.md)
 An open-source AI tool to transcribe, losslessly optimize, and summarize videos/podcasts.
 Paste a URL from YouTube, Bilibili, TikTok, Apple Podcasts, and 30+ platforms, or upload a local audio/video file.
 
-A rebuilt fork (RE) of [wendy7756/AI-Video-Transcriber](https://github.com/wendy7756/AI-Video-Transcriber).
+A re-edited fork (RE = Re-Edit) of [wendy7756/AI-Video-Transcriber](https://github.com/wendy7756/AI-Video-Transcriber).
 
 ![Interface](en_video.png)
 
