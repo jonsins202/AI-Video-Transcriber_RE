@@ -30,7 +30,7 @@
 python start.py --prod
 ```
 
-- 访问 `http://localhost:8000`
+- 访问 `http://localhost:9000`
 - API key 在 UI「AI Settings」填，或设 `OPENAI_API_KEY` / `OPENAI_BASE_URL`
 - `--prod` 禁用热重载，长视频 SSE 稳定
 - **改代码后必须重启服务**

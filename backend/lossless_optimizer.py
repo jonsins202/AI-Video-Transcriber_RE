@@ -182,11 +182,50 @@ def build_batches(
     return batches
 
 
+# 保真校验阈值：单次编辑跨度 <= span_limit 视为词级校对；
+# 变短不再立即拒绝，而是计入删除预算，仅防整句/整段消失
+@dataclass(frozen=True)
+class FidelityLimits:
+    span_limit: int
+    replace_ratio: float
+    replace_floor: int
+    insert_ratio: float
+    insert_floor: int
+    delete_ratio: float
+    delete_floor: int
+    anchor_min: int  # 首尾各 12 个有效字符中至少要对齐的字符数（防掐头去尾）
+
+
+LOSSLESS_LIMITS = FidelityLimits(
+    span_limit=12,
+    replace_ratio=0.05, replace_floor=4,
+    insert_ratio=0.03, insert_floor=2,
+    delete_ratio=0.03, delete_floor=1,
+    anchor_min=8,
+)
+
+# 口语清理档：删填充词/顺句需要更大预算；锚点检查仍防截断，但不保证逐字。
+# 删除 30%：实测每小句带 呃/嗯/啊/对吧/就是说 的激进口语清理量约 28%，留余量；
+# 病态密度（>1/3 是填充词）仍被拦下回退。锚点 5/12：首句重度顺句不误杀，
+# 摘要式改写/截断对齐接近 0 仍被拦。
+CLEANUP_LIMITS = FidelityLimits(
+    span_limit=40,
+    replace_ratio=0.40, replace_floor=8,
+    insert_ratio=0.10, insert_floor=4,
+    delete_ratio=0.30, delete_floor=8,
+    anchor_min=5,
+)
+
+
 def _effective(text: str) -> str:
     return "".join(char.lower() for char in text if char.isalnum())
 
 
-def validate_segment_text(source: str, candidate: str) -> FidelityResult:
+def validate_segment_text(
+    source: str,
+    candidate: str,
+    limits: FidelityLimits = LOSSLESS_LIMITS,
+) -> FidelityResult:
     if not isinstance(candidate, str) or not candidate.strip():
         return FidelityResult(False, "empty")
 
@@ -203,24 +242,28 @@ def validate_segment_text(source: str, candidate: str) -> FidelityResult:
             aligned_source_indexes.update(range(i1, i2))
         elif tag == "delete":
             deleted += source_len
-            return FidelityResult(False, "content_deleted", replaced, inserted, deleted)
+            if source_len > limits.span_limit:
+                return FidelityResult(False, "content_deleted", replaced, inserted, deleted)
         elif tag == "replace":
             replaced += source_len
             if candidate_len < source_len:
-                return FidelityResult(False, "content_deleted", replaced, inserted, deleted)
-            if source_len > 12 or candidate_len > 12:
+                deleted += source_len - candidate_len
+            if source_len > limits.span_limit or candidate_len > limits.span_limit:
                 return FidelityResult(False, "replace_span_too_large", replaced, inserted, deleted)
         elif tag == "insert":
             inserted += candidate_len
-            if candidate_len > 12:
+            if candidate_len > limits.span_limit:
                 return FidelityResult(False, "insert_span_too_large", replaced, inserted, deleted)
 
-    replace_limit = max(4, math.floor(len(source_effective) * 0.05))
-    insert_limit = max(2, math.floor(len(source_effective) * 0.03))
+    replace_limit = max(limits.replace_floor, math.floor(len(source_effective) * limits.replace_ratio))
+    insert_limit = max(limits.insert_floor, math.floor(len(source_effective) * limits.insert_ratio))
+    delete_limit = max(limits.delete_floor, math.floor(len(source_effective) * limits.delete_ratio))
     if replaced > replace_limit:
         return FidelityResult(False, "too_much_replaced", replaced, inserted, deleted)
     if inserted > insert_limit:
         return FidelityResult(False, "too_much_inserted", replaced, inserted, deleted)
+    if deleted > delete_limit:
+        return FidelityResult(False, "too_much_deleted", replaced, inserted, deleted)
 
     if len(source_effective) >= 12:
         head_matches = sum(index in aligned_source_indexes for index in range(12))
@@ -228,9 +271,9 @@ def validate_segment_text(source: str, candidate: str) -> FidelityResult:
             index in aligned_source_indexes
             for index in range(len(source_effective) - 12, len(source_effective))
         )
-        if head_matches < 8:
+        if head_matches < limits.anchor_min:
             return FidelityResult(False, "head_anchor_missing", replaced, inserted, deleted)
-        if tail_matches < 8:
+        if tail_matches < limits.anchor_min:
             return FidelityResult(False, "tail_anchor_missing", replaced, inserted, deleted)
 
     return FidelityResult(True, "accepted", replaced, inserted, deleted)
@@ -252,6 +295,7 @@ def _fallback_decision(segment: SourceSegment, status: str, reason: str) -> Segm
 def evaluate_batch_response(
     source_segments: Sequence[SourceSegment],
     payload: Any,
+    limits: FidelityLimits = LOSSLESS_LIMITS,
 ) -> dict[str, SegmentDecision]:
     expected = {segment.id: segment for segment in source_segments}
     grouped: dict[str, list[Any]] = defaultdict(list)
@@ -283,7 +327,7 @@ def evaluate_batch_response(
                 segment, "fallback_empty", "empty"
             )
             continue
-        fidelity = validate_segment_text(segment.source_text, candidate)
+        fidelity = validate_segment_text(segment.source_text, candidate, limits)
         if not fidelity.accepted:
             decision = _fallback_decision(
                 segment, "fallback_fidelity", fidelity.reason

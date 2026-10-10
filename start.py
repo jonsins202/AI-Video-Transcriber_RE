@@ -16,6 +16,10 @@ for _stream in (sys.stdout, sys.stderr):
     except Exception:
         pass
 
+# 加载项目根 .env（已有环境变量优先，不覆盖），让 PORT / OPENAI_* 等对启动脚本同样生效
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).parent / ".env")
+
 def check_dependencies():
     """检查依赖是否安装"""
     import sys
@@ -82,7 +86,7 @@ def setup_environment():
         default_model = str(Path(__file__).parent / "models" / "Qwen3-ASR-0.6B")
         os.environ["QWEN3_ASR_MODEL_PATH"] = default_model
 
-    # ASR 后端默认配置（FunASR 为默认；改 ASR_BACKEND=qwen 切回 Qwen3-ASR）
+    # ASR 后端默认配置（FunASR 为默认；ASR_BACKEND=qwen 切本地 Qwen3-ASR，dashscope 切云端）
     os.environ.setdefault("ASR_BACKEND", "funasr")
     os.environ.setdefault("FUNASR_MODEL", "paraformer")
     os.environ.setdefault("FUNASR_DEVICE", "cuda")
@@ -128,7 +132,9 @@ def main():
     
     # 启动服务器
     host = os.getenv("HOST", "0.0.0.0")
-    port = int(os.getenv("PORT", 8000))
+    port = int(os.getenv("PORT", 9000))
+    if "--port" in sys.argv:  # 临时覆盖：python start.py --prod --port 9001
+        port = int(sys.argv[sys.argv.index("--port") + 1])
     
     print(f"\n🌐 启动服务器...")
     print(f"   地址: http://localhost:{port}")

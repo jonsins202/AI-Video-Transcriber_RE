@@ -558,5 +558,81 @@ hello 大家好这是正文
         self.assertEqual(Summarizer.extract_transcript_body(raw), raw)
 
 
+class CleanupPipelineTests(unittest.IsolatedAsyncioTestCase):
+    """口语清理管线：复用 lossless 引擎，CLEANUP 档校验；失败回退输入原文。"""
+
+    # 占位凭据仅供构造客户端（随后即被 _FakeClient 替换），非真实密钥
+    _PLACEHOLDER_KEY = os.environ.get("TEST_API_KEY", "placeholder-not-a-real-key")
+
+    def _make_summarizer(self, responder):
+        summarizer = Summarizer(api_key=self._PLACEHOLDER_KEY)
+        self.calls = []
+        summarizer.client = _FakeClient(self.calls, responder)
+        return summarizer
+
+    @staticmethod
+    def _request_payload(kwargs):
+        return json.loads(kwargs["messages"][-1]["content"])
+
+    @staticmethod
+    def _echo_kwargs_responder(kwargs):
+        request = json.loads(kwargs["messages"][-1]["content"])
+        return _Response(json.dumps({"segments": [
+            {"id": seg["id"], "text": seg["text"]}
+            for seg in request["segments"]
+        ]}, ensure_ascii=False))
+
+    async def test_cleanup_removes_fillers(self):
+        def responder(kwargs):
+            request = self._request_payload(kwargs)
+            return _Response(json.dumps({"segments": [
+                {"id": seg["id"], "text": seg["text"].replace("呃", "").replace("啊", "").replace("嗯", "")}
+                for seg in request["segments"]
+            ]}, ensure_ascii=False))
+
+        summarizer = self._make_summarizer(responder)
+        source = "呃我们今天聊一聊啊人工智能的行业发展嗯顺便说说大模型的机会" * 60
+        result = await summarizer.cleanup_transcript_body(source, "zh")
+        self.assertNotIn("呃", result)
+        self.assertNotIn("嗯", result)
+        self.assertIn("我们今天聊一聊人工智能的行业发展", result)
+        audit = summarizer.get_last_cleanup_audit()
+        self.assertGreater(audit["status_counts"].get("optimized", 0), 0)
+
+    async def test_cleanup_bad_ids_fall_back_to_source(self):
+        def responder(kwargs):
+            return _Response(json.dumps(
+                {"segments": [{"id": "wrong-id", "text": "被篡改的正文"}]},
+                ensure_ascii=False,
+            ))
+
+        summarizer = self._make_summarizer(responder)
+        source = "口误重复的内容也需要完整保留" * 40
+        result = await summarizer.cleanup_transcript_body(source, "zh")
+        self.assertEqual(result.replace("\n", ""), source)
+        audit = summarizer.get_last_cleanup_audit()
+        self.assertGreater(audit["status_counts"].get("fallback_structure", 0), 0)
+
+    async def test_cleanup_api_failure_returns_source(self):
+        def responder(kwargs):
+            raise RuntimeError("boom")
+
+        summarizer = self._make_summarizer(responder)
+        source = "接口异常情况下口语清理必须回退原文" * 40
+        result = await summarizer.cleanup_transcript_body(source, "zh")
+        self.assertEqual(result.replace("\n", ""), source)
+        audit = summarizer.get_last_cleanup_audit()
+        self.assertGreater(audit["status_counts"].get("fallback_api", 0), 0)
+
+    async def test_cleanup_prompt_forbids_content_changes(self):
+        summarizer = self._make_summarizer(self._echo_kwargs_responder)
+        source = "检查清理提示词的正文" * 40
+        await summarizer.cleanup_transcript_body(source, "zh")
+        system_prompt = self.calls[0]["messages"][0]["content"]
+        self.assertIn("口语清理", system_prompt)
+        self.assertIn("不删实义内容", system_prompt)
+        self.assertIn("人名/数字/术语/引用必须原样保留", system_prompt)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -81,7 +81,7 @@ ASR 模型在 `.gitignore` 中，需单独下载。Paraformer 首次转录时也
 python start.py --prod
 ```
 
-- 访问 `http://localhost:8000`
+- 访问 `http://localhost:9000`
 - API key 在页面 **AI Settings** 中填写，或设环境变量 `OPENAI_API_KEY` / `OPENAI_BASE_URL`
 - `--prod` 禁用热重载，保持长任务 SSE 连接稳定（**长视频必须用**）
 

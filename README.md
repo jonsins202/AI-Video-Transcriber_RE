@@ -48,7 +48,7 @@ pip install -r requirements.txt
 python start.py --prod
 ```
 
-- Visit `http://localhost:8000`
+- Visit `http://localhost:9000`
 - Enter your API key in the UI **AI Settings** panel, or set `OPENAI_API_KEY` / `OPENAI_BASE_URL` env vars.
 - The Paraformer model (~1.1GB) auto-downloads from ModelScope on first transcription (China-friendly, no proxy needed).
 - `--prod` disables hot-reload for stable SSE on long tasks. **Restart the service after code changes.**

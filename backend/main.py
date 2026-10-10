@@ -9,17 +9,25 @@ import logging
 import logging.handlers
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 import aiofiles
 import uuid
 import json
 import re
 import openai
+from pydantic import BaseModel, Field
+
+# 加载项目根 .env（已有环境变量优先，不覆盖）；必须在 backend 各模块 import 前执行，
+# 因为 video_processor 等模块在 import 时就读取环境变量
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).parent.parent / ".env")
 
 from video_processor import VideoProcessor
-from transcriber import Transcriber
+from transcriber import Transcriber, rename_speaker_labels
 from summarizer import Summarizer
 from translator import Translator
+import media_cache
+import optimize_cache
 
 # ── 日志配置：控制台 + 文件（按天轮转，保留 30 天）─────────────────────
 def setup_logging():
@@ -71,6 +79,15 @@ video_processor = VideoProcessor()
 transcriber = Transcriber()
 summarizer = Summarizer()
 translator = Translator()
+
+# 启动横幅：验证 .env/环境变量是否真的生效（grep "服务启动"）
+logger.info(
+    "服务启动: "
+    f"ASR={os.getenv('ASR_BACKEND', 'funasr')}/{os.getenv('FUNASR_MODEL', 'paraformer')}, "
+    f"说话人分离={os.getenv('FUNASR_SPK') or '关'}, "
+    f"固定人数={os.getenv('FUNASR_SPK_NUM') or '自动'}, "
+    f"媒体缓存={'开' if media_cache.enabled() else '关'}"
+)
 
 # 存储任务状态 - 使用文件持久化
 import threading
@@ -127,6 +144,73 @@ active_tasks = {}
 # 存储SSE连接，用于实时推送状态更新
 sse_connections = {}
 
+# ── 批量队列：串行 worker（GPU/LLM 并发限制，一次只处理一个任务）──────────
+_task_queue: asyncio.Queue = asyncio.Queue()
+_queue_worker_task: Optional[asyncio.Task] = None
+
+
+async def _queue_worker():
+    """串行队列消费者：逐个处理 queued 任务，任何异常都不让 worker 退出。"""
+    while True:
+        try:
+            task_id = await _task_queue.get()
+            t = tasks.get(task_id)
+            if t is None or t.get("queue_status") != "queued":
+                continue  # 任务已被删除或取消
+
+            settings = t.get("settings") or {}
+            url = t.get("url") or ""
+
+            t.update({
+                "queue_status": "running",
+                "status": "processing",
+                "message": "开始处理...",
+            })
+            save_tasks(tasks)
+            await broadcast_task_update(task_id, t)
+            processing_urls.add(url)
+
+            try:
+                runner = asyncio.create_task(process_video_task(
+                    task_id,
+                    url,
+                    settings.get("summary_language", "zh"),
+                    settings.get("api_key", ""),
+                    settings.get("model_base_url", ""),
+                    settings.get("model_id", ""),
+                    settings.get("oral_cleanup", False),
+                    _parse_spk_num(settings.get("spk_num", "")),
+                ))
+                active_tasks[task_id] = runner
+                await runner
+            except asyncio.CancelledError:
+                # runner 被 DELETE 取消时任务记录已删除 → 静默收尾；
+                # worker 自身被取消（应用关闭）→ 上抛让 worker 退出
+                if tasks.get(task_id) is not None:
+                    raise
+            finally:
+                if task_id in active_tasks:
+                    del active_tasks[task_id]
+                t = tasks.get(task_id)
+                if t is not None:
+                    # 正常完成/失败 → done；异常中断（如服务关闭）→ interrupted，重启后可重新入队
+                    t["queue_status"] = "done" if t.get("status") in ("completed", "error") else "interrupted"
+                    save_tasks(tasks)
+                    await broadcast_task_update(task_id, t)
+        except Exception:
+            logger.exception("队列 worker 异常，继续处理下一个任务")
+
+
+def _strip_first_heading(text: str) -> str:
+    """去掉正文首个非空行的一级标题（合并文档的章节标题已携带标题）。"""
+    lines = text.replace("\r\n", "\n").split("\n")
+    for i, line in enumerate(lines):
+        if line.strip():
+            if line.strip().startswith("# "):
+                del lines[i]
+            break
+    return "\n".join(lines).strip()
+
 
 @contextmanager
 def _stage(task_id: str, stage: str):
@@ -181,11 +265,23 @@ async def _write_optimization_audit(path: Path, audit: dict) -> None:
         await f.write(json.dumps(audit, ensure_ascii=False, indent=2))
 
 
-def _make_optimize_progress_callback(task_id: str, start: int = 55, end: int = 68):
-    """构造 on_progress(done, total)：把无损优化批次完成进度映射到 start→end 的进度条。
+def _parse_spk_num(raw: str) -> Optional[int]:
+    """前端说话人数输入 → 1-30 的整数；空/非法返回 None（自动检测）。"""
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    try:
+        n = int(raw)
+    except (ValueError, TypeError):
+        return None
+    return n if 1 <= n <= 30 else None
+
+
+def _make_stage_progress_callback(task_id: str, start: int, end: int, label: str):
+    """构造 on_progress(done, total)：把批次完成进度映射到 start→end 的进度条。
 
     单调保护：asyncio 单线程下 completed+=1 到写 progress 之间无 await，再加
-    pct<=当前值则跳过，确保进度绝不倒退。end=68 给后续 translate(70)/summarize(80) 留空间。"""
+    pct<=当前值则跳过，确保进度绝不倒退。调用方需保证 start 大于前一阶段终值。"""
     async def _on_progress(done: int, total: int) -> None:
         if total <= 0:
             return
@@ -196,7 +292,7 @@ def _make_optimize_progress_callback(task_id: str, start: int = 55, end: int = 6
         if pct <= task.get("progress", 0):
             return
         task["progress"] = pct
-        task["message"] = f"正在优化转录文本... ({done}/{total})"
+        task["message"] = f"{label} ({done}/{total})"
         save_tasks(tasks)
         await broadcast_task_update(task_id, task)
     return _on_progress
@@ -213,6 +309,7 @@ async def _run_post_extract_pipeline(
     api_key: str = "",
     model_base_url: str = "",
     model_id: str = "",
+    oral_cleanup: bool = False,
 ) -> None:
     """取得 raw_script 后的共用管线：归档、优化、翻译、摘要、广播。"""
     short_id = task_id.replace("-", "")[:6]
@@ -238,11 +335,37 @@ async def _run_post_extract_pipeline(
     await broadcast_task_update(task_id, tasks[task_id])
 
     transcript_body = request_summarizer.extract_transcript_body(raw_script)
-    with _stage(task_id, "optimize"):
-        script = await request_summarizer.optimize_transcript_body(
-            transcript_body,
-            on_progress=_make_optimize_progress_callback(task_id),
+    if os.getenv("SKIP_OPTIMIZE", "").strip() in ("1", "true", "True"):
+        # 云端 ASR 自带标点、错字很少时可跳过无损优化，省一次 LLM 调用
+        request_summarizer.reset_audits()
+        script = transcript_body
+        tasks[task_id].update({"progress": 63, "message": "已跳过无损优化（SKIP_OPTIMIZE）"})
+        save_tasks(tasks)
+        await broadcast_task_update(task_id, tasks[task_id])
+        logger.info(f"SKIP_OPTIMIZE=1，跳过无损优化: {task_id}")
+    else:
+        optimize_key = optimize_cache.make_key(
+            transcript_body, request_summarizer.fast_model, optimize_cache.LOSSLESS_PROFILE
         )
+        cached_script = optimize_cache.lookup(optimize_key)
+        if cached_script is not None:
+            # 缓存命中跳过了优化调用，需清掉全局单例可能残留的上一任务 audit
+            request_summarizer.reset_audits()
+            script = cached_script
+            tasks[task_id]["optimize_cache"] = "hit"
+            tasks[task_id].update({"progress": 63, "message": "命中优化缓存，跳过无损优化"})
+            save_tasks(tasks)
+            await broadcast_task_update(task_id, tasks[task_id])
+            logger.info(f"优化缓存命中，跳过无损优化: {task_id}")
+        else:
+            with _stage(task_id, "optimize"):
+                script = await request_summarizer.optimize_transcript_body(
+                    transcript_body,
+                    on_progress=_make_stage_progress_callback(
+                        task_id, 55, 63, "正在优化转录文本..."
+                    ),
+                )
+            optimize_cache.store(optimize_key, script)
 
     audit = request_summarizer.get_last_optimization_audit()
     if audit:
@@ -255,6 +378,58 @@ async def _run_post_extract_pipeline(
             logger.exception("保存无损优化审计失败，不影响转录结果")
 
     script_with_title = f"# {video_title}\n\n{script}\n\nsource: {source_ref}\n"
+
+    if oral_cleanup:
+        # 口语清理是非逐字操作：先归档无损优化后的逐字稿，清理失败也有底稿
+        try:
+            verbatim_filename = f"verbatim_{safe_title}_{short_id}.md"
+            with open(TEMP_DIR / verbatim_filename, "w", encoding="utf-8") as f:
+                f.write(script_with_title)
+            tasks[task_id]["verbatim_script_file"] = verbatim_filename
+            tasks[task_id]["oral_cleanup"] = True
+            save_tasks(tasks)
+        except Exception:
+            logger.exception("保存逐字稿失败，不影响后续清理")
+
+        tasks[task_id].update({
+            "progress": 65,
+            "message": "正在清理口语...",
+        })
+        save_tasks(tasks)
+        await broadcast_task_update(task_id, tasks[task_id])
+
+        cleanup_key = optimize_cache.make_key(
+            script, request_summarizer.fast_model, optimize_cache.CLEANUP_PROFILE
+        )
+        cached_cleanup = optimize_cache.lookup(cleanup_key)
+        if cached_cleanup is not None:
+            request_summarizer.reset_audits()
+            script = cached_cleanup
+            tasks[task_id]["cleanup_cache"] = "hit"
+            tasks[task_id].update({"progress": 72, "message": "命中清理缓存，跳过口语清理"})
+            save_tasks(tasks)
+            await broadcast_task_update(task_id, tasks[task_id])
+            logger.info(f"清理缓存命中，跳过口语清理: {task_id}")
+        else:
+            with _stage(task_id, "oral_cleanup"):
+                script = await request_summarizer.cleanup_transcript_body(
+                    script,
+                    on_progress=_make_stage_progress_callback(
+                        task_id, 66, 72, "正在清理口语..."
+                    ),
+                )
+            optimize_cache.store(cleanup_key, script)
+        script_with_title = f"# {video_title}\n\n{script}\n\nsource: {source_ref}\n"
+
+        cleanup_audit = request_summarizer.get_last_cleanup_audit()
+        if cleanup_audit:
+            try:
+                cleanup_audit_filename = f"cleanup_audit_{safe_title}_{short_id}.json"
+                await _write_optimization_audit(TEMP_DIR / cleanup_audit_filename, cleanup_audit)
+                tasks[task_id]["cleanup_audit_file"] = cleanup_audit_filename
+                save_tasks(tasks)
+            except Exception:
+                logger.exception("保存口语清理审计失败，不影响转录结果")
 
     detected_language = transcriber.get_detected_language(raw_script)
     detected_language = (detected_language or "").strip()
@@ -286,7 +461,7 @@ async def _run_post_extract_pipeline(
     if need_translation:
         logger.info(f"需要翻译: {detected_language} -> {summary_language}")
         tasks[task_id].update({
-            "progress": 70,
+            "progress": 75,
             "message": "正在生成翻译...",
         })
         save_tasks(tasks)
@@ -308,7 +483,7 @@ async def _run_post_extract_pipeline(
         )
 
     tasks[task_id].update({
-        "progress": 80,
+        "progress": 85,
         "message": "正在生成摘要...",
     })
     save_tasks(tasks)
@@ -409,6 +584,8 @@ async def _enqueue_upload_job(
     api_key: str,
     model_base_url: str,
     model_id: str,
+    oral_cleanup: bool = False,
+    spk_num: Optional[int] = None,
 ) -> dict:
     """保存上传文件并入队 process_upload_task，返回 {task_id, message}。"""
     raw_name = file.filename or "upload.bin"
@@ -477,6 +654,8 @@ async def _enqueue_upload_job(
             api_key,
             model_base_url,
             model_id,
+            oral_cleanup,
+            spk_num,
         )
     )
     active_tasks[task_id] = bg
@@ -491,16 +670,20 @@ async def process_video(
     api_key: str = Form(default=""),
     model_base_url: str = Form(default=""),
     model_id: str = Form(default=""),
+    oral_cleanup: bool = Form(default=False),
+    spk_num: str = Form(default=""),
     file: Optional[UploadFile] = File(None),
 ):
     """
     处理视频链接或本地上传（multipart 中带 file 且无有效 URL 时走上传流程）。
     上传与 URL 共用此路径，便于反向代理只放行 /api/process-video 的环境。
     """
+    parsed_spk_num = _parse_spk_num(spk_num)
     try:
         if file is not None and (file.filename or "").strip():
             return await _enqueue_upload_job(
-                file, summary_language, api_key, model_base_url, model_id
+                file, summary_language, api_key, model_base_url, model_id, oral_cleanup,
+                parsed_spk_num,
             )
 
         stripped = (url or "").strip()
@@ -538,7 +721,10 @@ async def process_video(
         save_tasks(tasks)
         
         # 创建并跟踪异步任务
-        task = asyncio.create_task(process_video_task(task_id, url, summary_language, api_key, model_base_url, model_id))
+        task = asyncio.create_task(process_video_task(
+            task_id, url, summary_language, api_key, model_base_url, model_id, oral_cleanup,
+            parsed_spk_num,
+        ))
         active_tasks[task_id] = task
         
         return {"task_id": task_id, "message": "任务已创建，正在处理中..."}
@@ -556,6 +742,8 @@ async def process_video_task(
     api_key: str = "",
     model_base_url: str = "",
     model_id: str = "",
+    oral_cleanup: bool = False,
+    spk_num: Optional[int] = None,
 ):
     """
     异步处理视频任务
@@ -583,15 +771,39 @@ async def process_video_task(
         else:
             request_summarizer = summarizer  # 全局实例（使用环境变量）
 
-        with _stage(task_id, "subtitle_fetch"):
-            subtitle_text, sub_title, sub_lang = await video_processor.fetch_subtitles(url, TEMP_DIR)
+        # ── 阶段〇：媒体缓存优先（最快路径：同 URL 直接复用转录，零网络） ──
+        # 指纹含按请求的说话人数：换人数重转录，不会命中旧稿
+        task_asr_key = media_cache.current_asr_key(spk_num=spk_num)
+        cached_raw = media_cache.lookup_raw(url, asr_key=task_asr_key)
+        if cached_raw is not None:
+            video_title = cached_raw["video_title"] or url
+            raw_script = cached_raw["raw_text"]
+            # 全局 transcriber 单例残留上一个任务的语言，必须显式用缓存值覆盖
+            transcriber.last_detected_language = cached_raw.get("detected_language")
 
-        if subtitle_text:
+            tasks[task_id].update({
+                "progress": 40,
+                "message": "命中本地转录缓存，跳过下载与转录",
+                "cache_hit": "raw",
+            })
+            save_tasks(tasks)
+            await broadcast_task_update(task_id, tasks[task_id])
+            logger.info(f"媒体缓存(raw)命中，跳过下载/转录: {url}")
+        else:
+            with _stage(task_id, "subtitle_fetch"):
+                subtitle_text, sub_title, sub_lang = await video_processor.fetch_subtitles(url, TEMP_DIR)
+
+        if cached_raw is not None:
+            pass  # 缓存命中：跳过字幕/下载/转录分支
+        elif subtitle_text:
             # ── 快速路径：有字幕，跳过音频下载和 ASR ──────────────────
             video_title = sub_title
             raw_script = subtitle_text
             # 把语言写入 transcriber，保持下游逻辑一致
             transcriber.last_detected_language = sub_lang
+            media_cache.record_raw(
+                url, raw_script, video_title, sub_lang, asr_key="subtitle"
+            )
 
             tasks[task_id].update({
                 "progress": 40,
@@ -608,17 +820,31 @@ async def process_video_task(
             save_tasks(tasks)
             await broadcast_task_update(task_id, tasks[task_id])
 
-            with _stage(task_id, "audio_download"):
-                audio_path, video_title = await video_processor.download_and_convert(
-                    url, TEMP_DIR, prefetched_title=sub_title or None
-                )
+            cached_audio = media_cache.lookup_audio(url)
+            if cached_audio is not None:
+                audio_path = str(cached_audio["path"])
+                video_title = cached_audio["video_title"] or sub_title or url
+                tasks[task_id].update({
+                    "progress": 35,
+                    "message": "命中本地音频缓存，跳过下载",
+                    "cache_hit": "audio",
+                })
+                save_tasks(tasks)
+                await broadcast_task_update(task_id, tasks[task_id])
+                logger.info(f"媒体缓存(audio)命中，跳过下载: {url}")
+            else:
+                with _stage(task_id, "audio_download"):
+                    audio_path, video_title = await video_processor.download_and_convert(
+                        url, TEMP_DIR, prefetched_title=sub_title or None
+                    )
+                media_cache.record_audio(url, audio_path, video_title)
 
-            tasks[task_id].update({
-                "progress": 35,
-                "message": "音频下载完成，准备转录..."
-            })
-            save_tasks(tasks)
-            await broadcast_task_update(task_id, tasks[task_id])
+                tasks[task_id].update({
+                    "progress": 35,
+                    "message": "音频下载完成，准备转录..."
+                })
+                save_tasks(tasks)
+                await broadcast_task_update(task_id, tasks[task_id])
 
             tasks[task_id].update({
                 "progress": 40,
@@ -628,7 +854,12 @@ async def process_video_task(
             await broadcast_task_update(task_id, tasks[task_id])
 
             with _stage(task_id, "transcribe"):
-                raw_script = await transcriber.transcribe(audio_path)
+                raw_script = await transcriber.transcribe(audio_path, spk_num=spk_num)
+            # 优化管线之前登记：即使优化失败，下次任务也免下载+转录
+            media_cache.record_raw(
+                url, raw_script, video_title, transcriber.last_detected_language,
+                asr_key=task_asr_key,
+            )
 
         await _run_post_extract_pipeline(
             task_id=task_id,
@@ -641,6 +872,7 @@ async def process_video_task(
             api_key=api_key,
             model_base_url=model_base_url,
             model_id=model_id,
+            oral_cleanup=oral_cleanup,
         )
 
         # 不要立即删除临时文件！保留给用户下载
@@ -663,6 +895,75 @@ async def process_video_task(
         save_tasks(tasks)
         await broadcast_task_update(task_id, tasks[task_id])
 
+class BatchItem(BaseModel):
+    """批量任务单项：字段与 /api/process-video 的表单参数一一对应。"""
+    url: str
+    summary_language: str = "zh"
+    oral_cleanup: bool = False
+    spk_num: str = ""          # 保持字符串语义，运行时用 _parse_spk_num 解析
+    api_key: str = ""
+    model_base_url: str = ""
+    model_id: str = ""
+
+
+class BatchRequest(BaseModel):
+    items: List[BatchItem]
+
+
+@app.post("/api/process-batch")
+async def process_batch(req: BatchRequest):
+    """批量入队：创建 queued 任务，由串行队列 worker 逐个处理（不立即占用 GPU）。"""
+    valid = []
+    skipped = []
+    seen = set()
+    for item in req.items:
+        url = (item.url or "").strip()
+        if not url:
+            continue
+        if url in seen:
+            skipped.append({"url": url, "reason": "批内重复链接"})
+            continue
+        seen.add(url)
+        if url in processing_urls:
+            skipped.append({"url": url, "reason": "该链接正在处理中"})
+            continue
+        valid.append(item)
+
+    if len(valid) > 10:
+        raise HTTPException(status_code=400, detail="批量任务最多支持 10 个链接")
+    if not valid:
+        raise HTTPException(status_code=400, detail="没有有效的链接")
+
+    batch_id = str(uuid.uuid4())
+    created = []
+    for item in valid:
+        task_id = str(uuid.uuid4())
+        tasks[task_id] = {
+            "status": "processing",
+            "progress": 0,
+            "message": "已加入队列，等待处理...",
+            "script": None,
+            "summary": None,
+            "error": None,
+            "url": item.url,
+            "batch_id": batch_id,
+            "queue_status": "queued",
+            "settings": {
+                "summary_language": item.summary_language,
+                "oral_cleanup": item.oral_cleanup,
+                "spk_num": item.spk_num,
+                "api_key": item.api_key,
+                "model_base_url": item.model_base_url,
+                "model_id": item.model_id,
+            },
+        }
+        created.append({"task_id": task_id, "url": item.url})
+
+    save_tasks(tasks)
+    for c in created:
+        await _task_queue.put(c["task_id"])
+    return {"batch_id": batch_id, "tasks": created, "skipped": skipped}
+
 @app.post("/api/process-upload")
 async def process_upload(
     file: UploadFile = File(...),
@@ -670,10 +971,13 @@ async def process_upload(
     api_key: str = Form(default=""),
     model_base_url: str = Form(default=""),
     model_id: str = Form(default=""),
+    oral_cleanup: bool = Form(default=False),
+    spk_num: str = Form(default=""),
 ):
     """独立上传入口；逻辑与 multipart 带 file 的 /api/process-video 相同。"""
     return await _enqueue_upload_job(
-        file, summary_language, api_key, model_base_url, model_id
+        file, summary_language, api_key, model_base_url, model_id, oral_cleanup,
+        _parse_spk_num(spk_num),
     )
 
 
@@ -687,6 +991,8 @@ async def process_upload_task(
     api_key: str = "",
     model_base_url: str = "",
     model_id: str = "",
+    oral_cleanup: bool = False,
+    spk_num: Optional[int] = None,
 ):
     source_ref = f"upload:{original_name}"
     try:
@@ -742,7 +1048,7 @@ async def process_upload_task(
             await broadcast_task_update(task_id, tasks[task_id])
 
             with _stage(task_id, "transcribe"):
-                raw_script = await transcriber.transcribe(audio_path)
+                raw_script = await transcriber.transcribe(audio_path, spk_num=spk_num)
 
         await _run_post_extract_pipeline(
             task_id=task_id,
@@ -755,6 +1061,7 @@ async def process_upload_task(
             api_key=api_key,
             model_base_url=model_base_url,
             model_id=model_id,
+            oral_cleanup=oral_cleanup,
         )
 
     except Exception as e:
@@ -768,6 +1075,41 @@ async def process_upload_task(
         })
         save_tasks(tasks)
         await broadcast_task_update(task_id, tasks[task_id])
+
+
+class SpeakerRenameRequest(BaseModel):
+    """说话人标签 → 真名 映射；值为空表示保留/还原为「说话人X：」。"""
+    speakers: dict = Field(default_factory=dict)
+
+
+@app.post("/api/task/{task_id}/speakers")
+async def rename_task_speakers(task_id: str, req: SpeakerRenameRequest):
+    """把已完成任务文稿中的「说话人A：」等标签替换为用户填写的真名。"""
+    task = tasks.get(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    script = task.get("script") or ""
+    if not script:
+        raise HTTPException(status_code=400, detail="任务没有转录文稿")
+
+    new_script, applied = rename_speaker_labels(
+        script, req.speakers, previous=task.get("speaker_names")
+    )
+    task["script"] = new_script
+    task["speaker_names"] = applied
+
+    script_path = task.get("script_path")
+    if script_path:
+        try:
+            async with aiofiles.open(script_path, "w", encoding="utf-8") as f:
+                await f.write(new_script)
+        except Exception:
+            logger.exception("重写转录文件失败，不影响任务状态")
+
+    save_tasks(tasks)
+    await broadcast_task_update(task_id, task)
+    logger.info(f"任务 {task_id} 说话人命名已应用: {applied}")
+    return task
 
 
 @app.get("/api/task-status/{task_id}")
@@ -809,9 +1151,9 @@ async def task_stream(task_id: str):
                     data = await asyncio.wait_for(queue.get(), timeout=30.0)
                     yield f"data: {data}\n\n"
                     
-                    # 如果任务完成或失败，结束流
+                    # 如果任务完成、失败或取消，结束流
                     task_data = json.loads(data)
-                    if task_data.get("status") in ["completed", "error"]:
+                    if task_data.get("status") in ["completed", "error", "cancelled"]:
                         break
                         
                 except asyncio.TimeoutError:
@@ -840,6 +1182,156 @@ async def task_stream(task_id: str):
             "Access-Control-Allow-Headers": "Cache-Control"
         }
     )
+
+@app.get("/api/tasks")
+async def list_tasks():
+    """轻量任务列表：不含文稿/摘要正文与文件路径，供前端轮询分组。"""
+    result = []
+    for tid, t in tasks.items():
+        status = t.get("status", "")
+        qs = t.get("queue_status") or ("done" if status in ("completed", "error") else "")
+        settings = t.get("settings") or {}
+        result.append({
+            "id": tid,
+            "url": t.get("url", ""),
+            "video_title": t.get("video_title", ""),
+            "status": status,
+            "queue_status": qs,
+            "progress": t.get("progress", 0),
+            "message": t.get("message", ""),
+            "error": t.get("error"),
+            "batch_id": t.get("batch_id", ""),
+            "summary_language": t.get("summary_language") or settings.get("summary_language", ""),
+            "oral_cleanup": bool(settings.get("oral_cleanup", False)),
+            "spk_num": settings.get("spk_num", ""),
+            "cache_hit": t.get("cache_hit"),
+            "completed_at": t.get("completed_at"),
+            "total_duration": t.get("total_duration"),
+            "timeline": t.get("timeline") or {},
+            "has_script": bool(t.get("script")),
+            "has_summary": bool(t.get("summary")),
+        })
+    return {"tasks": result}
+
+
+@app.post("/api/task/{task_id}/requeue")
+async def requeue_task(task_id: str):
+    """重新入队：仅允许失败（error）或服务重启中断（interrupted）的任务。"""
+    t = tasks.get(task_id)
+    if t is None:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    status = t.get("status", "")
+    qs = t.get("queue_status", "")
+    if status != "error" and qs != "interrupted":
+        raise HTTPException(
+            status_code=400,
+            detail=f"当前状态不可重新入队（status={status}, queue_status={qs}）",
+        )
+    t.update({
+        "queue_status": "queued",
+        "status": "processing",
+        "progress": 0,
+        "message": "已重新入队，等待处理...",
+        "error": None,
+    })
+    save_tasks(tasks)
+    await _task_queue.put(task_id)
+    await broadcast_task_update(task_id, t)
+    return t
+
+
+@app.post("/api/task/{task_id}/cancel")
+async def cancel_task(task_id: str):
+    """取消排队中的任务（仅限 queued 状态，运行中请用 DELETE）。"""
+    t = tasks.get(task_id)
+    if t is None:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    if t.get("queue_status") != "queued":
+        raise HTTPException(
+            status_code=400,
+            detail=f"当前状态不可取消（queue_status={t.get('queue_status', '')}）",
+        )
+    t.update({
+        "queue_status": "cancelled",
+        "status": "cancelled",
+        "message": "已取消",
+        "error": None,
+    })
+    save_tasks(tasks)
+    await broadcast_task_update(task_id, t)
+    return t
+
+
+class MergeRequest(BaseModel):
+    """合并请求：要合并的任务 ID 列表（至少 1 个）。"""
+    task_ids: List[str]
+
+
+@app.post("/api/batch/merge")
+async def merge_tasks(req: MergeRequest):
+    """合并多个已完成任务的转录+摘要为单个 Markdown 文档。"""
+    if not req.task_ids:
+        raise HTTPException(status_code=400, detail="task_ids 不能为空")
+    missing = [tid for tid in req.task_ids if tid not in tasks]
+    if missing:
+        raise HTTPException(status_code=404, detail=f"任务不存在: {missing[0]}")
+
+    merged = []
+    failed = []
+    for tid in req.task_ids:
+        t = tasks[tid]
+        if t.get("status") != "completed" or not (t.get("script") or "").strip():
+            reason = "任务未完成" if t.get("status") != "completed" else "无转录文稿"
+            failed.append({"task_id": tid, "url": t.get("url", ""), "reason": reason})
+            continue
+        merged.append(t)
+
+    if not merged:
+        raise HTTPException(status_code=400, detail="没有可合并的已完成任务")
+
+    from datetime import datetime
+    now = datetime.now()
+    lines = [
+        f"# 批量转录合并文档 · {now.strftime('%Y-%m-%d %H:%M')}",
+        "",
+        f"共 {len(req.task_ids)} 个任务：成功 {len(merged)} · 未收录 {len(failed)}",
+        "",
+        "## 目录",
+    ]
+    for i, t in enumerate(merged, 1):
+        title = t.get("video_title") or t.get("url") or f"任务{i}"
+        lines.append(f"{i}. {title}")
+    lines += ["", "---", ""]
+    for i, t in enumerate(merged, 1):
+        title = t.get("video_title") or t.get("url") or f"任务{i}"
+        lines += [
+            f"## {i}. {title}",
+            f"> 来源：{t.get('url', '')} · 总耗时 {t.get('total_duration', 0)}s · 完成于 {t.get('completed_at', '')}",
+            "",
+            "### 转录文本",
+            "",
+            _strip_first_heading(t.get("script", "")),
+            "",
+            "### 智能摘要",
+            "",
+            (t.get("summary") or "").strip(),
+            "",
+            "---",
+            "",
+        ]
+    if failed:
+        for f in failed:
+            lines.append(f"> 未收录：{f['task_id']}（{f['url']}）：{f['reason']}")
+        lines.append("")
+
+    filename = f"merged_transcripts_{now.strftime('%Y%m%d_%H%M%S')}.md"
+    (TEMP_DIR / filename).write_text("\n".join(lines), encoding="utf-8")
+    return {
+        "filename": filename,
+        "download_url": f"/api/download/{filename}",
+        "merged": len(merged),
+        "failed": failed,
+    }
 
 @app.get("/api/download/{filename}")
 async def download_file(filename: str):
@@ -909,6 +1401,23 @@ async def get_active_tasks():
         "task_ids": list(active_tasks.keys())
     }
 
+@app.on_event("startup")
+async def _startup_batch_queue():
+    """启动时：中断遗留任务（排队中 + 重启前残留的 processing 僵尸）+ 启动串行队列 worker。"""
+    global _queue_worker_task
+    changed = False
+    for t in tasks.values():
+        # 启动时刻不存在任何"还在跑"的任务：status==processing 的一律是遗留
+        # （queued 队列项 / running 崩溃残留 / 旧版本直跑僵尸）——统一标记中断，可重新入队
+        if t.get("status") == "processing":
+            t["queue_status"] = "interrupted"
+            t["message"] = "服务重启，任务中断，请在任务列表中重新入队"
+            changed = True
+    if changed:
+        save_tasks(tasks)
+    _queue_worker_task = asyncio.create_task(_queue_worker())
+
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 9000)))

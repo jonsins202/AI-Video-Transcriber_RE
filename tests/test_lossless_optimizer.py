@@ -5,6 +5,7 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "backend"))
 
 from lossless_optimizer import (  # noqa: E402
+    CLEANUP_LIMITS,
     assemble_segments,
     build_batches,
     evaluate_batch_response,
@@ -55,10 +56,75 @@ class FidelityValidationTests(unittest.TestCase):
         result = validate_segment_text("今天嘉宾是科粒移民", "今天嘉宾是柯丽一鸣")
         self.assertTrue(result.accepted, result.reason)
 
+    def test_word_level_shortening_fix_passes(self):
+        # 真实分段为 200+ 字符（split_source_segments min_chars=200），按同长度构造
+        filler = "这一段是完整保留的正文内容，用于模拟真实分段的长度。" * 5
+        result = validate_segment_text(
+            "里面有提到anstrophic这家公司做的大模型。" + filler,
+            "里面有提到Anthropic这家公司做的大模型。" + filler,
+        )
+        self.assertTrue(result.accepted, result.reason)
+
     def test_content_deletion_fails(self):
         result = validate_segment_text("主持人介绍完整内容", "主持人介绍内容")
         self.assertFalse(result.accepted)
+        self.assertEqual(result.reason, "too_much_deleted")
+
+    def test_whole_sentence_deletion_fails(self):
+        result = validate_segment_text(
+            "今天我们请到一位特别嘉宾，聊一聊人工智能行业的最新发展。",
+            "今天我们请到一位特别嘉宾。",
+        )
+        self.assertFalse(result.accepted)
         self.assertEqual(result.reason, "content_deleted")
+
+    def test_many_small_deletes_exceeding_budget_fail(self):
+        source = "我们呃这个啊" * 17
+        candidate = "我们这个" * 17
+        result = validate_segment_text(source, candidate)
+        self.assertFalse(result.accepted)
+        self.assertEqual(result.reason, "too_much_deleted")
+
+
+class CleanupProfileTests(unittest.TestCase):
+    """口语清理档（CLEANUP_LIMITS）：放行删填充词/顺句，仍拦截改写与截断。"""
+
+    # 真实口语填充词密度约 5-15%（本语料 3/27 ≈ 11%），33% 的病态密度应被预算拦下
+    _FILLER_SOURCE = "呃我们今天聊一聊啊人工智能的行业发展嗯顺便说说大模型的机会" * 17
+    _FILLER_CLEANED = "我们今天聊一聊人工智能的行业发展顺便说说大模型的机会" * 17
+
+    def test_filler_removal_passes_under_cleanup_limits(self):
+        result = validate_segment_text(
+            self._FILLER_SOURCE, self._FILLER_CLEANED, CLEANUP_LIMITS
+        )
+        self.assertTrue(result.accepted, result.reason)
+
+    def test_same_filler_removal_still_rejected_under_lossless_limits(self):
+        result = validate_segment_text(self._FILLER_SOURCE, self._FILLER_CLEANED)
+        self.assertFalse(result.accepted)
+
+    def test_pathological_filler_density_rejected_under_cleanup_limits(self):
+        result = validate_segment_text("我们呃这个啊" * 17, "我们这个" * 17, CLEANUP_LIMITS)
+        self.assertFalse(result.accepted)
+        self.assertEqual(result.reason, "too_much_deleted")
+
+    def test_summary_rewrite_fails_under_cleanup_limits(self):
+        source = "主持人的开场寒暄引用举例和详细论述都必须保留" * 100
+        candidate = "本段主要讨论访谈主题。" * 50
+        self.assertFalse(validate_segment_text(source, candidate, CLEANUP_LIMITS).accepted)
+
+    def test_head_truncation_fails_under_cleanup_limits(self):
+        source = "句首内容绝不允许被裁剪掉" + "后续正文持续保持不变。" * 30
+        candidate = "后续正文持续保持不变。" * 30
+        result = validate_segment_text(source, candidate, CLEANUP_LIMITS)
+        self.assertFalse(result.accepted)
+        self.assertEqual(result.reason, "head_anchor_missing")
+
+    def test_whole_sentence_deletion_fails_under_cleanup_limits(self):
+        source = "这句话必须完整保留不能删掉。" * 20
+        candidate = "这句话必须完整保留。" * 20
+        result = validate_segment_text(source, candidate, CLEANUP_LIMITS)
+        self.assertFalse(result.accepted)
 
     def test_summary_rewrite_fails_even_when_long(self):
         source = "这是完整访谈原文包含开场寒暄引用举例以及详细论述" * 20

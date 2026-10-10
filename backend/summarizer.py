@@ -10,6 +10,8 @@ from typing import Optional, Callable, Awaitable
 
 from llm_sanitize import strip_llm_artifacts
 from lossless_optimizer import (
+    CLEANUP_LIMITS,
+    LOSSLESS_LIMITS,
     SegmentBatch,
     assemble_segments,
     build_batches,
@@ -51,6 +53,7 @@ class Summarizer:
         self.fast_model     = model or "gpt-3.5-turbo"
         self.advanced_model = model or "gpt-4o"
         self.last_optimization_audit = None
+        self.last_cleanup_audit = None
         
         # 支持的语言映射
         self.language_map = {
@@ -116,6 +119,11 @@ class Summarizer:
     def get_last_optimization_audit(self) -> Optional[dict]:
         return self.last_optimization_audit
 
+    def reset_audits(self) -> None:
+        """缓存命中跳过阶段时调用：防全局单例残留上一个任务的 audit 串味。"""
+        self.last_optimization_audit = None
+        self.last_cleanup_audit = None
+
     @staticmethod
     def _extract_json_object(content: str) -> dict:
         text = (content or "").strip()
@@ -131,7 +139,12 @@ class Summarizer:
             raise ValueError("response JSON must be an object")
         return payload
 
-    async def _call_lossless_batch(self, batch: SegmentBatch, language: str) -> dict:
+    async def _call_lossless_batch(
+        self,
+        batch: SegmentBatch,
+        language: str,
+        system_prompt: Optional[str] = None,
+    ) -> dict:
         request_payload = {
             "left_context": batch.left_context,
             "segments": [
@@ -140,19 +153,25 @@ class Summarizer:
             ],
             "right_context": batch.right_context,
         }
-        system_prompt = (
-            "你是严格无损的转录校对器。left_context/right_context 仅供理解，禁止输出。"
-            "segments 中每个 id 必须恰好返回一次且不可改名、遗漏、重复或重排。"
-            "只允许添加标点和分段、修正少量错别字/同音字/专有名词；"
-            "禁止删除、概括、合并、扩写或改变任何口语、重复、寒暄、引用和举例。"
-            "只输出一个 JSON 对象：{\"segments\":[{\"id\":\"...\",\"text\":\"...\"}]}。"
-            f"正文语言：{language or 'unknown'}。"
-        )
+        if system_prompt is None:
+            system_prompt = (
+                "你是严格无损的转录校对器。left_context/right_context 仅供理解，禁止输出。"
+                "segments 中每个 id 必须恰好返回一次且不可改名、遗漏、重复或重排。"
+                "只允许添加标点和分段、修正少量错别字/同音字/专有名词；"
+                "禁止删除、概括、合并、扩写或改变任何口语、重复、寒暄、引用和举例。"
+                "若正文含说话人标签（如「说话人A：」），必须原样保留，不得增删或改写标签。"
+                "只输出一个 JSON 对象：{\"segments\":[{\"id\":\"...\",\"text\":\"...\"}]}。"
+                f"正文语言：{language or 'unknown'}。"
+            )
         max_retries = 3
         base_delay = 2.0
         cap_delay = 20.0
         for attempt in range(max_retries + 1):
             try:
+                try:
+                    max_tokens = int(os.getenv("LOSSLESS_MAX_TOKENS", "8000"))
+                except (ValueError, TypeError):
+                    max_tokens = 8000
                 response = await asyncio.to_thread(
                     self.client.chat.completions.create,
                     model=self.fast_model,
@@ -163,7 +182,7 @@ class Summarizer:
                             "content": json.dumps(request_payload, ensure_ascii=False),
                         },
                     ],
-                    max_tokens=5000,
+                    max_tokens=max_tokens,
                     temperature=0.0,
                 )
                 if not getattr(response, "choices", None):
@@ -219,9 +238,14 @@ class Summarizer:
         return delay + random.uniform(0.0, 1.0)  # full jitter，避免惊群
 
     async def _process_lossless_batch(
-        self, batch: SegmentBatch, language: str, allow_split: bool = True
+        self,
+        batch: SegmentBatch,
+        language: str,
+        allow_split: bool = True,
+        system_prompt: Optional[str] = None,
+        limits=LOSSLESS_LIMITS,
     ) -> dict:
-        result = await self._call_lossless_batch(batch, language)
+        result = await self._call_lossless_batch(batch, language, system_prompt)
         if (
             not result.get("ok")
             and result.get("finish_reason") == "length"
@@ -231,16 +255,20 @@ class Summarizer:
             midpoint = len(batch.segments) // 2
             left = SegmentBatch(tuple(batch.segments[:midpoint]), batch.left_context, "")
             right = SegmentBatch(tuple(batch.segments[midpoint:]), "", batch.right_context)
-            decisions = await self._process_lossless_batch(left, language, allow_split=False)
+            decisions = await self._process_lossless_batch(
+                left, language, allow_split=False, system_prompt=system_prompt, limits=limits
+            )
             decisions.update(
-                await self._process_lossless_batch(right, language, allow_split=False)
+                await self._process_lossless_batch(
+                    right, language, allow_split=False, system_prompt=system_prompt, limits=limits
+                )
             )
             return decisions
         if not result.get("ok"):
             fail_reason = result.get("reason")
             # rate_limited 已在 _call_lossless_batch 内退避重试过，这里跳过立即重试避免双重退避
             if fail_reason != "rate_limited":
-                retry = await self._call_lossless_batch(batch, language)
+                retry = await self._call_lossless_batch(batch, language, system_prompt)
                 if retry.get("ok"):
                     result = retry
                 else:
@@ -253,19 +281,27 @@ class Summarizer:
                     else "fallback_api"
                 )
                 return fallback_batch(batch.segments, status, reason)
-        return evaluate_batch_response(batch.segments, result["payload"])
+        return evaluate_batch_response(batch.segments, result["payload"], limits)
 
-    async def _optimize_lossless_body(
+    async def _run_segment_pipeline(
         self,
         body: str,
         language: str,
+        system_prompt: Optional[str],
+        limits,
+        audit_attr: str,
+        stage_label: str,
         on_progress: Optional[Callable[[int, int], Awaitable[None]]] = None,
     ) -> str:
         segments = split_source_segments(body)
-        batches = build_batches(body, segments)
+        try:
+            batch_chars = int(os.getenv("LOSSLESS_BATCH_CHARS", "5000"))
+        except (ValueError, TypeError):
+            batch_chars = 5000
+        batches = build_batches(body, segments, target_chars=batch_chars)
         decisions = {}
         if not self.client:
-            logger.warning("OpenAI API不可用，无损优化全部回退原文")
+            logger.warning(f"{stage_label}: OpenAI API不可用，全部回退原文")
             for batch in batches:
                 decisions.update(
                     fallback_batch(batch.segments, "fallback_api", "client_unavailable")
@@ -279,7 +315,7 @@ class Summarizer:
             total = len(batches)
             completed = 0
             logger.info(
-                f"无损优化: {len(segments)} 段, {total} 批, 并发 {concurrency}"
+                f"{stage_label}: {len(segments)} 段, {total} 批, 并发 {concurrency}"
             )
 
             async def _run_one(idx: int, batch: SegmentBatch) -> dict:
@@ -288,17 +324,19 @@ class Summarizer:
                 # 否则递归二分会重复占槽位、压垮有效并发。
                 async with sem:
                     try:
-                        result = await self._process_lossless_batch(batch, language)
+                        result = await self._process_lossless_batch(
+                            batch, language, system_prompt=system_prompt, limits=limits
+                        )
                     except Exception:
-                        logger.exception(f"无损优化批次 {idx}/{total} 异常，回退原文")
+                        logger.exception(f"{stage_label}批次 {idx}/{total} 异常，回退原文")
                         result = fallback_batch(batch.segments, "fallback_api", "exception")
                 completed += 1
-                logger.info(f"无损优化批次 {idx}/{total} 完成")
+                logger.info(f"{stage_label}批次 {idx}/{total} 完成")
                 if on_progress is not None:
                     try:
                         await on_progress(completed, total)
                     except Exception:
-                        logger.debug("无损优化进度回调异常，忽略")
+                        logger.debug(f"{stage_label}进度回调异常，忽略")
                 return result
 
             batch_results = list(await asyncio.gather(
@@ -308,7 +346,7 @@ class Summarizer:
                 decisions.update(r)
 
         status_counts = Counter(decision.status for decision in decisions.values())
-        self.last_optimization_audit = {
+        audit = {
             "model": self.fast_model,
             "source_length": len(body),
             "segment_count": len(segments),
@@ -330,7 +368,80 @@ class Summarizer:
                 for segment in segments
             ],
         }
+        setattr(self, audit_attr, audit)
         return assemble_segments(segments, decisions)
+
+    async def _optimize_lossless_body(
+        self,
+        body: str,
+        language: str,
+        on_progress: Optional[Callable[[int, int], Awaitable[None]]] = None,
+    ) -> str:
+        return await self._run_segment_pipeline(
+            body, language,
+            system_prompt=None,
+            limits=LOSSLESS_LIMITS,
+            audit_attr="last_optimization_audit",
+            stage_label="无损优化",
+            on_progress=on_progress,
+        )
+
+    async def cleanup_transcript_body(
+        self,
+        body: str,
+        transcript_language: Optional[str] = None,
+        on_progress: Optional[Callable[[int, int], Awaitable[None]]] = None,
+    ) -> str:
+        """口语清理：删语气填充词、顺句；输入应为无损优化后的逐字稿。
+
+        非逐字保真：结构对账 + 无截断 + 修改量有界（CLEANUP_LIMITS）。
+        任何未验证段或管线异常均回退输入原文（安全侧失败）。"""
+        if not body:
+            self.last_cleanup_audit = {
+                "model": self.fast_model,
+                "source_length": 0,
+                "segment_count": 0,
+                "batch_count": 0,
+                "status_counts": {},
+                "segments": [],
+            }
+            return body
+        language = transcript_language or self._detect_transcript_language(body)
+        system_prompt = (
+            "你是转录文本的口语清理编辑。left_context/right_context 仅供理解，禁止输出。"
+            "segments 中每个 id 必须恰好返回一次且不可改名、遗漏、重复或重排。"
+            "允许且只允许：删除语气填充词（呃/嗯/啊/欸，以及纯填充用法的"
+            "「这个/那个/就是说/对吧/然后呢」）、修复口误重复和断句残片、"
+            "句内顺句使表达通顺、规范标点。"
+            "硬规则：不改变意思，不删实义内容，不概括，不扩写，不添加新信息；"
+            "人名/数字/术语/引用必须原样保留；保持人称和语气。"
+            "若正文含说话人标签（如「说话人A：」），必须原样保留，不得增删或改写标签。"
+            "只输出一个 JSON 对象：{\"segments\":[{\"id\":\"...\",\"text\":\"...\"}]}。"
+            f"正文语言：{language or 'unknown'}。"
+        )
+        try:
+            return await self._run_segment_pipeline(
+                body, language,
+                system_prompt=system_prompt,
+                limits=CLEANUP_LIMITS,
+                audit_attr="last_cleanup_audit",
+                stage_label="口语清理",
+                on_progress=on_progress,
+            )
+        except Exception:
+            logger.exception("口语清理管线异常，返回清理前文本")
+            self.last_cleanup_audit = {
+                "model": self.fast_model,
+                "source_length": len(body),
+                "segment_count": 0,
+                "batch_count": 0,
+                "status_counts": {"fallback_pipeline": 1},
+                "segments": [],
+            }
+            return body
+
+    def get_last_cleanup_audit(self) -> Optional[dict]:
+        return self.last_cleanup_audit
 
     def _estimate_tokens(self, text: str) -> int:
         """
